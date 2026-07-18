@@ -2,14 +2,14 @@
 
 A pluggable, adaptive human-verification/captcha layer for FastAPI.
 
-Framework-only -- no assumption about who's connecting, or how they log
-in. Originally built as part of
-[discord-webapi](https://github.com/cruciblelab/discord-webapi) and split
-out because none of it is actually Discord-specific: IP reputation,
-behavioral scoring, replay detection, self-hosted and third-party captcha
-providers, an adaptive "Cloudflare-style" page guard, and a bundled JS
-widget all work the same whether your users arrive via Discord OAuth,
-your own login, or no login at all.
+We designed it framework-only -- no assumption about who's connecting,
+or how they log in. We originally built it as part of
+[discord-webapi](https://github.com/cruciblelab/discord-webapi) and
+split it out because none of it is actually Discord-specific: IP
+reputation, behavioral scoring, replay detection, self-hosted and
+third-party captcha providers, an adaptive "Cloudflare-style" page
+guard, and a bundled JS widget all work the same whether your users
+arrive via Discord OAuth, your own login, or no login at all.
 
 License: Apache 2.0.
 
@@ -112,8 +112,8 @@ async def my_check(ctx):
 CaptchaGate(transport, store, provider, extra_checks=[PredicateCheck("fingerprint", my_check)])
 ```
 
-`require_account=True` needs to know who's currently signed in -- this
-package has no login system of its own, so you pass your own FastAPI
+`require_account=True` needs to know who's currently signed in -- we
+don't ship a login system of our own, so you pass your own FastAPI
 dependency as `current_user_id_resolver=` resolving to the signed-in
 user's id (or `None`). See `webapi_captcha.api`'s module docstring for a
 worked example wiring this up against
@@ -223,6 +223,6 @@ Discord user needs zero extra wiring. discord-webapi's own
 this package's `Transport` Protocol, so they interoperate without any
 adapter.
 
-Using this package on its own, with a different framework's login, or
-with no login at all? None of the above applies -- everything here works
-standalone, with no dependency on discord-webapi whatsoever.
+Using this on its own, with a different framework's login, or with no
+login at all? None of the above applies -- we built everything here to
+work standalone, with no dependency on discord-webapi whatsoever.
