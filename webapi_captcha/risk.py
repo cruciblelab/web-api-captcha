@@ -208,14 +208,18 @@ class ReputationRiskSignal:
     to the strongest tier."
     """
 
-    name = "ip-reputation"
-    weight = 3.0
-
     def __init__(
-        self, reputation: IPReputationChecker, *, override_level: RiskLevel = RiskLevel.HIGH
+        self,
+        reputation: IPReputationChecker,
+        *,
+        override_level: RiskLevel = RiskLevel.HIGH,
+        name: str = "ip-reputation",
+        weight: float = 3.0,
     ) -> None:
         self.reputation = reputation
         self.override_level = override_level
+        self.name = name
+        self.weight = weight
 
     async def assess(self, ctx: RiskContext) -> RiskContribution:
         if ctx.client_ip is None:
@@ -233,11 +237,16 @@ class BehaviorScoreRiskSignal:
     empty -- which it structurally IS the first time a decision is made
     (before any client-side widget has posted anything)."""
 
-    name = "behavior-score"
-    weight = 2.0
-
-    def __init__(self, check: SignalScoreCheck | None = None) -> None:
+    def __init__(
+        self,
+        check: SignalScoreCheck | None = None,
+        *,
+        name: str = "behavior-score",
+        weight: float = 2.0,
+    ) -> None:
         self.check = check or SignalScoreCheck()
+        self.name = name
+        self.weight = weight
 
     async def assess(self, ctx: RiskContext) -> RiskContribution:
         if not ctx.signals:
