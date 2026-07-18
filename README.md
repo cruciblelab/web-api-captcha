@@ -245,9 +245,54 @@ gate = AdaptiveCaptchaGate(
   calling reCAPTCHA/hCaptcha on every request" piece: this whole
   decision runs first and for free, and only the challenge that a
   configured tier actually needs (self-hosted or third-party) gets
-  called at all.
+  called at all. A bundled frontend "beacon" does the posting for you --
+  `app.include_router(build_passive_risk_beacon_router())` plus one
+  `<script src="/static/webapi-captcha-beacon.js"></script>` tag on any
+  `PageGuard`-protected page (works even when no captcha widget is
+  rendered on it at all, which is the normal case for a clean visitor).
 - `risk_engine=None` (the default) keeps today's exact
   `reputation.is_suspicious()` behavior -- this is entirely additive.
+
+Every signal (built-in or your own) supports a plain `enabled: bool`
+attribute -- `engine.get_signal("behavior-score").enabled = False` turns
+one off at runtime (a feature flag, an API you've stopped trusting)
+without losing its position/config, and `RiskEngine.assess()` skips a
+disabled signal entirely.
+
+**Requiring more than one signal to agree** -- by default
+`ReputationRiskSignal` unilaterally overrides to `HIGH` the moment its
+reputation source flags an IP, with no corroboration. Wrap it (and
+anything else) in `CorroboratedRiskSignal` if that's too blunt for your
+deployment:
+
+```python
+from webapi_captcha import CorroboratedRiskSignal, ReputationRiskSignal, BehaviorScoreRiskSignal
+
+risk_engine = RiskEngine([
+    CorroboratedRiskSignal([
+        ReputationRiskSignal(my_reputation_source),
+        BehaviorScoreRiskSignal(),
+    ]),  # a bad IP alone no longer forces HIGH -- needs a second signal to agree too
+])
+```
+`min_agreements=` (default: every enabled child) lets you require k-of-n
+instead of strict AND.
+
+**Replay detection feeding the same risk decision** -- `ReplayRiskSignal`
+bridges the existing cross-request replay defense
+(`RepeatedMovementCheck`/`TrajectoryFingerprintStore`) into `RiskEngine`,
+so a detected replay can escalate `RiskLevel` too, not just fail its own
+separate `VerificationCheck`. It's read-only (never records a
+fingerprint itself -- that stays `RepeatedMovementCheck`'s job); mount
+both against the *same* store:
+
+```python
+from webapi_captcha import ReplayRiskSignal, RepeatedMovementCheck, MemoryTrajectoryFingerprintStore
+
+fp_store = MemoryTrajectoryFingerprintStore()
+risk_engine = RiskEngine([ReplayRiskSignal(fp_store)])
+gate = AdaptiveCaptchaGate(..., risk_engine=risk_engine, extra_checks=[RepeatedMovementCheck(fp_store)])
+```
 
 ## Bundled widget
 

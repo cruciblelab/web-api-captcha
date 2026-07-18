@@ -41,22 +41,38 @@ from webapi_captcha.checks import CheckOutcome, VerificationContext
 # rounding to a 6px/25ms grid still leaves plenty of entropy), but any
 # exact replay of the same recording -- deltas from its own first sample
 # -- collides every time, because the quantized deltas are identical.
-_GRID_PX = 6.0
-_GRID_MS = 25.0
-_MAX_FINGERPRINT_POINTS = 200  # a coarse shape fingerprint doesn't need every sample
-_MIN_FINGERPRINT_POINTS = 5
+DEFAULT_GRID_PX = 6.0
+DEFAULT_GRID_MS = 25.0
+DEFAULT_MAX_FINGERPRINT_POINTS = 200  # a coarse shape fingerprint doesn't need every sample
+DEFAULT_MIN_FINGERPRINT_POINTS = 5
 
 
-def fingerprint_trajectory(trajectory: Any) -> str | None:
+def fingerprint_trajectory(
+    trajectory: Any,
+    *,
+    grid_px: float = DEFAULT_GRID_PX,
+    grid_ms: float = DEFAULT_GRID_MS,
+    max_points: int = DEFAULT_MAX_FINGERPRINT_POINTS,
+    min_points: int = DEFAULT_MIN_FINGERPRINT_POINTS,
+) -> str | None:
     """Builds a coarse, translation-invariant fingerprint from a
     `mouse_trajectory` signal: quantized `(dx, dy, dt)` deltas relative to
     the first sample, hashed. `None` if `trajectory` isn't a usable
     trajectory (missing, too short, malformed) -- callers treat that as
-    "nothing to check", not as suspicious on its own."""
-    if not isinstance(trajectory, list) or len(trajectory) < _MIN_FINGERPRINT_POINTS:
+    "nothing to check", not as suspicious on its own.
+
+    `grid_px`/`grid_ms`/`max_points`/`min_points` default to this
+    module's own constants -- override them to make the fingerprint
+    coarser (catch more near-identical-but-not-exact replays, at the
+    cost of more false collisions between genuinely different
+    movements) or finer (the opposite trade). `RepeatedMovementCheck`
+    and `webapi_captcha.risk.ReplayRiskSignal` both accept the same four
+    parameters and thread them through here -- keep them matched across
+    both if you use both against the same store."""
+    if not isinstance(trajectory, list) or len(trajectory) < min_points:
         return None
     points: list[tuple[float, float, float]] = []
-    for sample in trajectory[:_MAX_FINGERPRINT_POINTS]:
+    for sample in trajectory[:max_points]:
         if not isinstance(sample, list | tuple) or len(sample) != 3:
             return None
         try:
@@ -65,7 +81,7 @@ def fingerprint_trajectory(trajectory: Any) -> str | None:
             return None
     x0, y0, t0 = points[0]
     quantized = tuple(
-        (round((x - x0) / _GRID_PX), round((y - y0) / _GRID_PX), round((t - t0) / _GRID_MS))
+        (round((x - x0) / grid_px), round((y - y0) / grid_px), round((t - t0) / grid_ms))
         for x, y, t in points
     )
     return hashlib.sha256(repr(quantized).encode()).hexdigest()
@@ -125,14 +141,28 @@ class RepeatedMovementCheck:
         store: TrajectoryFingerprintStore,
         *,
         ttl: timedelta = timedelta(hours=24),
+        grid_px: float = DEFAULT_GRID_PX,
+        grid_ms: float = DEFAULT_GRID_MS,
+        max_fingerprint_points: int = DEFAULT_MAX_FINGERPRINT_POINTS,
+        min_fingerprint_points: int = DEFAULT_MIN_FINGERPRINT_POINTS,
     ) -> None:
         self.store = store
         self.ttl = ttl
+        self.grid_px = grid_px
+        self.grid_ms = grid_ms
+        self.max_fingerprint_points = max_fingerprint_points
+        self.min_fingerprint_points = min_fingerprint_points
 
     async def run(self, ctx: VerificationContext) -> CheckOutcome:
         if ctx.signals.get("pointer_type") in ("touch", "pen"):
             return CheckOutcome(True)
-        fingerprint = fingerprint_trajectory(ctx.signals.get("mouse_trajectory"))
+        fingerprint = fingerprint_trajectory(
+            ctx.signals.get("mouse_trajectory"),
+            grid_px=self.grid_px,
+            grid_ms=self.grid_ms,
+            max_points=self.max_fingerprint_points,
+            min_points=self.min_fingerprint_points,
+        )
         if fingerprint is None:
             return CheckOutcome(True)
         if await self.store.seen_recently(fingerprint):

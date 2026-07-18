@@ -45,6 +45,45 @@ def test_different_shapes_get_different_fingerprints() -> None:
     assert fingerprint_trajectory(_TRAJECTORY_A) != fingerprint_trajectory(_TRAJECTORY_B)
 
 
+def test_fingerprint_trajectory_accepts_custom_grid_params() -> None:
+    """Regression guard: passing today's default values explicitly must
+    equal the no-kwargs call -- confirms the rename from private module
+    constants to public DEFAULT_* ones didn't change any behavior."""
+    from webapi_captcha.replay_guard import (
+        DEFAULT_GRID_MS,
+        DEFAULT_GRID_PX,
+        DEFAULT_MAX_FINGERPRINT_POINTS,
+        DEFAULT_MIN_FINGERPRINT_POINTS,
+    )
+
+    explicit = fingerprint_trajectory(
+        _TRAJECTORY_A,
+        grid_px=DEFAULT_GRID_PX,
+        grid_ms=DEFAULT_GRID_MS,
+        max_points=DEFAULT_MAX_FINGERPRINT_POINTS,
+        min_points=DEFAULT_MIN_FINGERPRINT_POINTS,
+    )
+    assert explicit == fingerprint_trajectory(_TRAJECTORY_A)
+
+
+def test_coarser_grid_collapses_two_previously_distinct_trajectories() -> None:
+    a = [[0, 0, 0], [10, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+    a_jitter = [[0, 0, 0], [12, 5, 20], [25, 15, 45], [40, 15, 70], [53, 15, 100]]
+
+    assert fingerprint_trajectory(a) != fingerprint_trajectory(a_jitter)
+    assert fingerprint_trajectory(a, grid_px=50.0) == fingerprint_trajectory(a_jitter, grid_px=50.0)
+
+
+def test_finer_grid_separates_two_previously_colliding_trajectories() -> None:
+    b = [[0, 0, 0], [10, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+    b_tiny_jitter = [[0, 0, 0], [11, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+
+    assert fingerprint_trajectory(b) == fingerprint_trajectory(b_tiny_jitter)
+    assert fingerprint_trajectory(b, grid_px=0.5) != fingerprint_trajectory(
+        b_tiny_jitter, grid_px=0.5
+    )
+
+
 def test_fingerprint_none_when_missing_or_malformed() -> None:
     assert fingerprint_trajectory(None) is None
     assert fingerprint_trajectory("not-a-list") is None
@@ -163,6 +202,25 @@ async def test_fails_open_for_touch_pointer() -> None:
 
     assert first.passed is True
     assert second.passed is True  # never recorded, so never "replayed" either
+
+
+async def test_repeated_movement_check_threads_custom_grid_params_through() -> None:
+    """A pair that collides under the default grid but not under a much
+    finer one -- constructing RepeatedMovementCheck with grid_px=0.5
+    must make the second submission pass instead of fail."""
+    b = [[0, 0, 0], [10, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+    b_tiny_jitter = [[0, 0, 0], [11, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+
+    store = MemoryTrajectoryFingerprintStore()
+    check = RepeatedMovementCheck(store, grid_px=0.5)
+
+    first = await check.run(_ctx({"pointer_type": "mouse", "mouse_trajectory": b}, token="t1"))
+    second = await check.run(
+        _ctx({"pointer_type": "mouse", "mouse_trajectory": b_tiny_jitter}, token="t2")
+    )
+
+    assert first.passed is True
+    assert second.passed is True  # would have been False under the default grid
 
 
 async def test_composes_into_a_gate_as_an_extra_check() -> None:

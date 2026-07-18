@@ -32,6 +32,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   rebuilding the gate/`PageGuard` stack; `signals`/`level_thresholds`/
   `short_circuit_on_override` stay plain public attributes too, for
   anything the three methods don't cover.
+- **`RiskEngine` extensions** (per-signal `enabled` toggle, corroboration,
+  replay integration, a frontend beacon): every shipped `RiskSignal`
+  (`ReputationRiskSignal`/`BehaviorScoreRiskSignal`/the two new ones
+  below) now takes an `enabled: bool = True` kwarg, and `RiskEngine.
+  assess()` skips a disabled signal entirely (no `assess()` call, no
+  `contributions` entry) -- toggle one off at runtime via `engine.
+  get_signal("x").enabled = False` without losing its position/config.
+  New **`CorroboratedRiskSignal`** requires 2+ underlying signals to
+  independently agree before firing an override, fixing
+  `ReputationRiskSignal`'s own "a bad IP alone jumps straight to the
+  strongest tier" behavior for deployments that want a second signal's
+  agreement first (`min_agreements=` for k-of-n instead of strict AND).
+  New **`ReplayRiskSignal`** bridges the existing cross-request replay
+  defense (`RepeatedMovementCheck`/`TrajectoryFingerprintStore`) into
+  `RiskEngine` so a detected replay can escalate `RiskLevel` too, not
+  just fail its own separate `VerificationCheck` -- deliberately
+  read-only (never calls `store.record()` itself, since `assess_risk()`
+  runs far more often than a real verification completes and would
+  otherwise poison the store from mere risk probes that never lead to a
+  solve). `replay_guard.py`'s fingerprinting grid (`DEFAULT_GRID_PX`/
+  `DEFAULT_GRID_MS`/`DEFAULT_MAX_FINGERPRINT_POINTS`/
+  `DEFAULT_MIN_FINGERPRINT_POINTS`) is now a set of public constants and
+  constructor/function keyword arguments on `fingerprint_trajectory()`/
+  `RepeatedMovementCheck`/`ReplayRiskSignal`, not hardcoded private
+  module constants. New **`webapi_captcha.beacon`** module
+  (`build_passive_risk_beacon_router()` + a bundled `beacon.js`) closes
+  the gap `build_passive_risk_router()` left open: a small, standalone
+  frontend script that periodically posts passive signals to it, working
+  even on pages with no captcha widget rendered at all (the normal case
+  for a clean `PageGuard`-protected visitor) -- deliberately a new file
+  pair rather than grafted onto the per-token `CaptchaWidget`, which
+  structurally can't run with zero widget divs on the page.
 - **`LoadAdaptiveDifficulty`** for `ProofOfWorkProvider`: pass it instead
   of a plain `int` difficulty to get mCaptcha-style load-adaptive PoW —
   difficulty tracks the recent rate of issued challenges and rises

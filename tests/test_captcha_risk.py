@@ -3,12 +3,21 @@ layer combining `IPReputationChecker`/`SignalScoreCheck`/custom signals
 into one ordered `RiskLevel`, in front of `AdaptiveCaptchaGate`/
 `PageGuard`'s escalation decision."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
+from webapi_captcha.checks import VerificationContext
+from webapi_captcha.models import VerificationRequest
+from webapi_captcha.replay_guard import (
+    MemoryTrajectoryFingerprintStore,
+    RepeatedMovementCheck,
+    fingerprint_trajectory,
+)
 from webapi_captcha.reputation import StaticBlocklistReputationChecker
 from webapi_captcha.risk import (
     BehaviorScoreRiskSignal,
+    CorroboratedRiskSignal,
     MemoryRunningRiskStore,
+    ReplayRiskSignal,
     ReputationRiskSignal,
     RiskContext,
     RiskContribution,
@@ -207,3 +216,276 @@ async def test_running_risk_store_bump_raises_but_never_lowers_the_level() -> No
 
     result = await store.bump(1, RiskLevel.HIGH, ttl=timedelta(minutes=5))
     assert result == RiskLevel.HIGH
+
+
+# -- enabled toggle --
+
+
+async def test_disabled_signal_is_skipped_entirely_no_contribution_entry() -> None:
+    signal = _FixedSignal("toggle-me", 0.9)
+    signal.enabled = False  # type: ignore[attr-defined]
+    engine = RiskEngine([signal])
+
+    assessment = await engine.assess(RiskContext())
+
+    assert "toggle-me" not in assessment.contributions
+    assert assessment.level == RiskLevel.MINIMAL
+
+
+async def test_disabled_signal_does_not_count_toward_short_circuit_bookkeeping() -> None:
+    disabled_override = _OverrideSignal("disabled-override", RiskLevel.HIGH)
+    disabled_override.enabled = False  # type: ignore[attr-defined]
+    trailing = _FixedSignal("still-runs", 0.0)
+    engine = RiskEngine([disabled_override, trailing], short_circuit_on_override=True)
+
+    assessment = await engine.assess(RiskContext())
+
+    assert trailing.calls == 1
+    assert assessment.level == RiskLevel.MINIMAL
+
+
+async def test_signal_without_enabled_attribute_defaults_to_enabled() -> None:
+    signal = _FixedSignal("no-enabled-attr", 0.9)
+    assert not hasattr(signal, "enabled")
+    engine = RiskEngine([signal])
+
+    assessment = await engine.assess(RiskContext())
+
+    assert "no-enabled-attr" in assessment.contributions
+
+
+async def test_reputation_and_behavior_signals_accept_and_store_enabled_kwarg() -> None:
+    reputation_signal = ReputationRiskSignal(
+        StaticBlocklistReputationChecker(blocked_ips={"1.2.3.4"}), enabled=False
+    )
+    behavior_signal = BehaviorScoreRiskSignal(enabled=False)
+    assert reputation_signal.enabled is False
+    assert behavior_signal.enabled is False
+
+    engine = RiskEngine([reputation_signal, behavior_signal])
+    assessment = await engine.assess(RiskContext(client_ip="1.2.3.4", signals={"webdriver": True}))
+
+    assert assessment.contributions == {}
+    assert assessment.level == RiskLevel.MINIMAL
+
+
+# -- CorroboratedRiskSignal --
+
+
+async def test_corroborated_signal_does_not_override_when_only_one_of_two_children_flags() -> None:
+    composite = CorroboratedRiskSignal(
+        [_OverrideSignal("bad-ip", RiskLevel.HIGH), _FixedSignal("clean-behavior", 0.0)]
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override is None
+
+
+async def test_corroborated_signal_overrides_when_all_children_flag() -> None:
+    composite = CorroboratedRiskSignal(
+        [_OverrideSignal("bad-ip", RiskLevel.HIGH), _FixedSignal("bad-behavior", 0.9)]
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override == RiskLevel.HIGH
+
+
+async def test_corroborated_signal_min_agreements_allows_k_of_n() -> None:
+    composite = CorroboratedRiskSignal(
+        [
+            _OverrideSignal("a", RiskLevel.HIGH),
+            _FixedSignal("b", 0.9),
+            _FixedSignal("c", 0.0),  # the one holdout
+        ],
+        min_agreements=2,
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override == RiskLevel.HIGH
+
+
+async def test_corroborated_signal_abstaining_child_blocks_default_all_must_agree() -> None:
+    composite = CorroboratedRiskSignal(
+        [_OverrideSignal("a", RiskLevel.HIGH), _FixedSignal("abstains", None)]
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override is None
+
+
+async def test_corroborated_signal_disabled_child_is_excluded_not_counted_as_unflagged() -> None:
+    disabled = _FixedSignal("disabled", 0.0)
+    disabled.enabled = False  # type: ignore[attr-defined]
+    composite = CorroboratedRiskSignal(
+        [_OverrideSignal("a", RiskLevel.HIGH), _FixedSignal("b", 0.9), disabled]
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override == RiskLevel.HIGH
+
+
+async def test_corroborated_signal_suspicion_is_the_agreement_fraction_when_not_firing() -> None:
+    # "a" (0.2) stays below the default suspicion_threshold (0.5) so it
+    # doesn't count as agreeing; "b" (0.6) does -- 1 of 2 agree.
+    composite = CorroboratedRiskSignal([_FixedSignal("a", 0.2), _FixedSignal("b", 0.6)])
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override is None
+    assert contribution.suspicion == 0.5
+
+
+async def test_corroborated_signal_one_agreeing_child_does_not_leak_its_own_suspicion() -> None:
+    """Regression test for the bug the agreement-fraction design fixes:
+    a single agreeing child (ReputationRiskSignal-shaped: suspicion=1.0)
+    alongside an ABSTAINING one must not let the composite's own
+    suspicion come out as 1.0 (which would independently cross
+    RiskEngine's HIGH threshold, silently defeating corroboration)."""
+    composite = CorroboratedRiskSignal(
+        [_OverrideSignal("agrees", RiskLevel.HIGH), _FixedSignal("abstains", None)]
+    )
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override is None
+    assert contribution.suspicion == 0.5
+    assert contribution.suspicion < 0.75  # RiskEngine's default HIGH threshold
+
+
+async def test_corroborated_signal_abstains_when_all_children_abstain_or_are_disabled() -> None:
+    disabled = _FixedSignal("disabled", 0.9)
+    disabled.enabled = False  # type: ignore[attr-defined]
+    composite = CorroboratedRiskSignal([_FixedSignal("abstains", None), disabled])
+    contribution = await composite.assess(RiskContext())
+    assert contribution.suspicion is None
+    assert contribution.hard_override is None
+
+
+async def test_corroborated_signal_child_exception_is_treated_as_abstention_not_a_crash() -> None:
+    composite = CorroboratedRiskSignal([_RaisingSignal(), _FixedSignal("b", 0.9)])
+    contribution = await composite.assess(RiskContext())
+    assert contribution.hard_override is None  # only one (of two active) agreed
+
+
+async def test_corroborated_signal_evaluates_every_child_ignoring_outer_short_circuit() -> None:
+    a = _OverrideSignal("a", RiskLevel.HIGH)
+    b = _FixedSignal("b", 0.0)
+    composite = CorroboratedRiskSignal([a, b])
+    await composite.assess(RiskContext())
+    assert a.calls == 1
+    assert b.calls == 1
+
+
+async def test_corroborated_reputation_and_behavior_integration_via_risk_engine() -> None:
+    blocklist = StaticBlocklistReputationChecker(blocked_ips={"9.9.9.9"})
+    composite = CorroboratedRiskSignal(
+        [ReputationRiskSignal(blocklist), BehaviorScoreRiskSignal()]
+    )
+    engine = RiskEngine([composite])
+
+    # Blocklisted IP alone, no behavior signals collected yet -> no override.
+    assessment = await engine.assess(RiskContext(client_ip="9.9.9.9"))
+    assert assessment.level < RiskLevel.HIGH
+
+    # Blocklisted IP AND suspicious behavior -> HIGH.
+    assessment = await engine.assess(
+        RiskContext(client_ip="9.9.9.9", signals={"webdriver": True})
+    )
+    assert assessment.level == RiskLevel.HIGH
+
+
+# -- ReplayRiskSignal --
+
+_TRAJECTORY_A = [[0, 0, 0], [10, 5, 20], [25, 12, 45], [40, 15, 70], [50, 15, 100]]
+
+
+async def test_replay_risk_signal_abstains_with_no_trajectory_or_touch_pointer() -> None:
+    signal = ReplayRiskSignal(MemoryTrajectoryFingerprintStore())
+
+    assert (await signal.assess(RiskContext(signals={}))).suspicion is None
+    assert (
+        await signal.assess(RiskContext(signals={"pointer_type": "touch"}))
+    ).suspicion is None
+
+
+async def test_replay_risk_signal_never_calls_store_record() -> None:
+    class _SpyStore:
+        def __init__(self) -> None:
+            self.record_calls = 0
+
+        async def seen_recently(self, fingerprint: str) -> bool:
+            return False
+
+        async def record(self, fingerprint: str, ttl: timedelta) -> None:
+            self.record_calls += 1
+
+    store = _SpyStore()
+    signal = ReplayRiskSignal(store)  # type: ignore[arg-type]
+    for _ in range(5):
+        await signal.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+
+    assert store.record_calls == 0
+
+
+async def test_replay_risk_signal_flags_a_fingerprint_recorded_by_repeated_movement_check() -> None:
+    store = MemoryTrajectoryFingerprintStore()
+    check = RepeatedMovementCheck(store)
+    signal = ReplayRiskSignal(store)
+
+    now = datetime.now(UTC)
+    request = VerificationRequest(
+        token="t1",
+        user_id=1,
+        purpose="test",
+        created_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    ctx = VerificationContext(request=request, signals={"mouse_trajectory": _TRAJECTORY_A})
+    outcome = await check.run(ctx)
+    assert outcome.passed is True  # first time -- not a replay, and it gets recorded
+
+    contribution = await signal.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+    assert contribution.hard_override == RiskLevel.HIGH
+
+
+async def test_replay_risk_signal_does_not_self_poison_across_repeated_assess_calls() -> None:
+    store = MemoryTrajectoryFingerprintStore()
+    signal = ReplayRiskSignal(store)
+
+    for _ in range(10):
+        contribution = await signal.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+        assert contribution.hard_override is None
+
+
+async def test_replay_risk_signal_override_level_none_produces_graded_suspicion() -> None:
+    store = MemoryTrajectoryFingerprintStore()
+    signal = ReplayRiskSignal(store, override_level=None)
+
+    # Manufacture a "seen" fingerprint by recording the real one directly.
+    fp = fingerprint_trajectory(_TRAJECTORY_A)
+    assert fp is not None
+    await store.record(fp, timedelta(hours=1))
+
+    contribution = await signal.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+    assert contribution.hard_override is None
+    assert contribution.suspicion == 1.0
+
+
+async def test_replay_risk_signal_custom_grid_params_match_a_configured_check() -> None:
+    store = MemoryTrajectoryFingerprintStore()
+    check = RepeatedMovementCheck(store, grid_px=1.0, grid_ms=5.0)
+    signal = ReplayRiskSignal(store, grid_px=1.0, grid_ms=5.0)
+
+    now = datetime.now(UTC)
+    request = VerificationRequest(
+        token="t2",
+        user_id=1,
+        purpose="test",
+        created_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    ctx = VerificationContext(request=request, signals={"mouse_trajectory": _TRAJECTORY_A})
+    await check.run(ctx)
+
+    contribution = await signal.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+    assert contribution.hard_override == RiskLevel.HIGH
+
+
+async def test_replay_risk_signal_respects_enabled_toggle_via_risk_engine() -> None:
+    store = MemoryTrajectoryFingerprintStore()
+    signal = ReplayRiskSignal(store, enabled=False)
+    engine = RiskEngine([signal])
+
+    assessment = await engine.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
+    assert "replay" not in assessment.contributions

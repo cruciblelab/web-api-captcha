@@ -27,6 +27,14 @@ from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any, Protocol, runtime_checkable
 
+from webapi_captcha.replay_guard import (
+    DEFAULT_GRID_MS,
+    DEFAULT_GRID_PX,
+    DEFAULT_MAX_FINGERPRINT_POINTS,
+    DEFAULT_MIN_FINGERPRINT_POINTS,
+    TrajectoryFingerprintStore,
+    fingerprint_trajectory,
+)
 from webapi_captcha.reputation import IPReputationChecker
 from webapi_captcha.scoring import SignalScoreCheck
 
@@ -87,7 +95,20 @@ class RiskSignal(Protocol):
     """A unit contributing to risk assessment. `weight` lives here
     (not a parallel name-keyed dict on the engine) so a signal's own
     tuning travels with it -- the same reason `ScoringHeuristic` bundles
-    its weight with its scoring function instead of a separate mapping."""
+    its weight with its scoring function instead of a separate mapping.
+
+    An `enabled: bool` attribute is an OPTIONAL convention, not a
+    Protocol requirement -- `RiskEngine.assess()` checks it via
+    `getattr(signal, "enabled", True)`, so a signal with no such
+    attribute (any existing hand-written signal, or a plain object)
+    is simply always enabled, and nothing breaks. Every signal shipped
+    in this module has one (`enabled: bool = True` in its `__init__`);
+    write your own the same way if you want it toggleable at runtime
+    the same way (`engine.get_signal("mine").enabled = False`) --
+    Protocol membership is deliberately NOT required for this, since
+    making it required would break every existing third-party signal
+    that predates this convention, for no real benefit (Python doesn't
+    need a declared attribute to allow reading/writing one)."""
 
     name: str
     weight: float
@@ -187,6 +208,8 @@ class RiskEngine:
         total_weight = 0.0
 
         for signal in self.signals:
+            if not getattr(signal, "enabled", True):
+                continue
             try:
                 contribution = await signal.assess(ctx)
             except Exception as exc:  # noqa: BLE001 -- fail open, see class docstring
@@ -257,11 +280,13 @@ class ReputationRiskSignal:
         override_level: RiskLevel = RiskLevel.HIGH,
         name: str = "ip-reputation",
         weight: float = 3.0,
+        enabled: bool = True,
     ) -> None:
         self.reputation = reputation
         self.override_level = override_level
         self.name = name
         self.weight = weight
+        self.enabled = enabled
 
     async def assess(self, ctx: RiskContext) -> RiskContribution:
         if ctx.client_ip is None:
@@ -285,10 +310,12 @@ class BehaviorScoreRiskSignal:
         *,
         name: str = "behavior-score",
         weight: float = 2.0,
+        enabled: bool = True,
     ) -> None:
         self.check = check or SignalScoreCheck()
         self.name = name
         self.weight = weight
+        self.enabled = enabled
 
     async def assess(self, ctx: RiskContext) -> RiskContribution:
         if not ctx.signals:
@@ -297,6 +324,214 @@ class BehaviorScoreRiskSignal:
         parts = ", ".join(f"{name}={value:.2f}" for name, value in breakdown.items())
         detail = f"human-likeness={score:.2f} [{parts}]"
         return RiskContribution(suspicion=1.0 - score, detail=detail)
+
+
+class CorroboratedRiskSignal:
+    """Requires 2+ underlying signals to independently agree before
+    firing an override -- the fix for `ReputationRiskSignal`'s own
+    "IP reputation alone jumps straight to the strongest tier" behavior
+    being too blunt for some deployments: wrap it alongside
+    `BehaviorScoreRiskSignal` (or any other signal) here instead of
+    adding `ReputationRiskSignal` to the engine directly, and a bad IP
+    on its own no longer forces an escalation -- it needs a second
+    signal to also look suspicious.
+
+    A child "agrees" (counts towards `min_agreements`) if it either (a)
+    returned its own `hard_override`, or (b) returned a `suspicion >=
+    suspicion_threshold` -- (b) exists because most signals (e.g.
+    `BehaviorScoreRiskSignal`) never set a `hard_override` at all, so
+    without it, wrapping one here could never count as "agreeing,"
+    making a mixed IP+behavior corroboration group impossible to build.
+
+    An ABSTAINING child (`suspicion=None`, no override -- e.g.
+    `ReputationRiskSignal` with no `client_ip`, `BehaviorScoreRiskSignal`
+    with no signals collected yet) never counts as agreeing, but also
+    isn't "clean" -- it's simply excluded from both the numerator and
+    denominator, the same fail-closed-on-uncertainty posture as the rest
+    of this package (an absent opinion should never quietly satisfy a
+    corroboration requirement).
+
+    A DISABLED child (`enabled=False`, see the `RiskSignal` Protocol
+    docstring) is excluded the same way, entirely -- not counted in
+    `min_agreements`'s denominator either. This matters: without it,
+    disabling one child would make the (default) "every child must
+    agree" requirement permanently unsatisfiable by an always-failing
+    phantom participant. The trade-off this creates is deliberate and
+    worth knowing: disabling children can make `min_agreements` (if set
+    higher than the number of children left enabled) unreachable until
+    you re-enable one -- surfaced here, not silently patched over.
+
+    `min_agreements=None` (the default) means every currently-enabled
+    child must agree -- literal AND. Set it explicitly (e.g. `2` over 3
+    children) for k-of-n tolerance instead.
+
+    When it fires, `suspicion=1.0` and `hard_override=override_level`
+    (the composite's OWN configured level -- not derived from children's
+    individual override levels, since most children never set one).
+
+    When it doesn't fire, its own `suspicion` is `flagged / active` --
+    the AGREEMENT FRACTION, not an average of the children's raw
+    suspicion values. This was the trickiest design point, and worth
+    spelling out because the first, more obvious choice (average the
+    active children's `suspicion`) is subtly wrong: with only one
+    non-abstaining child (a common shape -- e.g. `ReputationRiskSignal`
+    flags while `BehaviorScoreRiskSignal` has no signals yet to work
+    with), an average of one value degenerates to exactly that child's
+    own `suspicion` -- which for `ReputationRiskSignal` is `1.0` on its
+    own, high enough to cross `RiskEngine`'s default `HIGH` threshold by
+    itself, silently recreating the unilateral-override problem this
+    whole class exists to prevent, just one layer removed and with no
+    `hard_override` set to make it obvious in a test. `flagged / active`
+    doesn't have this failure mode: this branch only runs when `flagged
+    < required`, so the fraction is always strictly below `required /
+    active <= 1.0` -- it structurally cannot alone reach the same
+    confidence as full agreement, which is the entire point.
+
+    Evaluates EVERY enabled child, always -- ignores the outer
+    `RiskEngine`'s `short_circuit_on_override`, since judging agreement
+    structurally needs every child's opinion. Each child still runs
+    inside its own `try`/`except` (an exception = abstention), same
+    fail-open ethos as `RiskEngine.assess()` itself.
+    """
+
+    def __init__(
+        self,
+        signals: Sequence[RiskSignal],
+        *,
+        override_level: RiskLevel = RiskLevel.HIGH,
+        suspicion_threshold: float = 0.5,
+        min_agreements: int | None = None,
+        name: str = "corroborated",
+        weight: float = 3.0,
+        enabled: bool = True,
+    ) -> None:
+        self.signals = list(signals)
+        self.override_level = override_level
+        self.suspicion_threshold = suspicion_threshold
+        self.min_agreements = min_agreements
+        self.name = name
+        self.weight = weight
+        self.enabled = enabled
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        flagged = 0
+        active = 0
+        contributed = 0  # active children that weren't themselves abstentions
+
+        for child in self.signals:
+            if not getattr(child, "enabled", True):
+                continue
+            active += 1
+            try:
+                contribution = await child.assess(ctx)
+            except Exception as exc:  # noqa: BLE001 -- fail open, see class docstring
+                contribution = RiskContribution(suspicion=None, detail=f"signal raised: {exc!r}")
+
+            if contribution.suspicion is not None or contribution.hard_override is not None:
+                contributed += 1
+
+            agreed = contribution.hard_override is not None or (
+                contribution.suspicion is not None
+                and contribution.suspicion >= self.suspicion_threshold
+            )
+            if agreed:
+                flagged += 1
+
+        if active == 0:
+            return RiskContribution(suspicion=None, detail="no active child signals")
+        if contributed == 0:
+            return RiskContribution(suspicion=None, detail="every active child signal abstained")
+
+        required = self.min_agreements if self.min_agreements is not None else active
+        if flagged >= required:
+            return RiskContribution(
+                suspicion=1.0,
+                hard_override=self.override_level,
+                detail=f"{flagged}/{active} child signals agreed",
+            )
+
+        return RiskContribution(
+            suspicion=flagged / active, detail=f"only {flagged}/{active} child signals agreed"
+        )
+
+
+class ReplayRiskSignal:
+    """Bridges the existing replay-detection primitives
+    (`webapi_captcha.replay_guard`) into a `RiskSignal`, so a detected
+    replay contributes to `RiskLevel` alongside IP reputation and
+    behavior score, not just as its own separate `VerificationCheck`.
+
+    **Read-only, on purpose -- never calls `store.record()`.**
+    `RiskEngine.assess()` (via `AdaptiveCaptchaGate.assess_risk()`) runs
+    far more often than a real verification completes -- every
+    `PageGuard.require_human()` call, every widget `get_info()` poll --
+    so if `assess()` also recorded the fingerprint, a page load that
+    never leads to a real solve would "burn" it as seen, poisoning the
+    store against a later *legitimate* first-time verification with a
+    naturally continuing trajectory shape, and flooding a shared global
+    store with harmless everyday-browsing fingerprints. Recording stays
+    exclusively `RepeatedMovementCheck.run()`'s job -- wire that in as an
+    `extra_check` against the SAME `TrajectoryFingerprintStore` instance,
+    or this signal will never have anything to flag. This is not a race
+    or a gap: a later, unrelated interaction (a different account/IP/
+    token -- exactly the cross-identity replay this module targets)
+    whose trajectory hashes to a fingerprint `RepeatedMovementCheck`
+    already recorded will correctly show up here as `seen_recently() ==
+    True`, and can escalate risk *before* that second interaction ever
+    reaches its own `verify()` call.
+
+    `override_level` defaults to `RiskLevel.HIGH` -- comparable
+    "outright bad" evidence to `ReputationRiskSignal`'s default, since a
+    replay match isn't a noisy heuristic, it's a cryptographic hash
+    match against something that has already, factually, been used once.
+    Pass `override_level=None` to get a graded `suspicion=1.0`
+    contribution instead, with no forced override -- e.g. to wrap this
+    signal in `CorroboratedRiskSignal` too, if you want even a detected
+    replay to need a second signal's agreement before forcing the top
+    tier."""
+
+    def __init__(
+        self,
+        store: TrajectoryFingerprintStore,
+        *,
+        override_level: RiskLevel | None = RiskLevel.HIGH,
+        name: str = "replay",
+        weight: float = 3.0,
+        enabled: bool = True,
+        grid_px: float = DEFAULT_GRID_PX,
+        grid_ms: float = DEFAULT_GRID_MS,
+        max_fingerprint_points: int = DEFAULT_MAX_FINGERPRINT_POINTS,
+        min_fingerprint_points: int = DEFAULT_MIN_FINGERPRINT_POINTS,
+    ) -> None:
+        self.store = store
+        self.override_level = override_level
+        self.name = name
+        self.weight = weight
+        self.enabled = enabled
+        self.grid_px = grid_px
+        self.grid_ms = grid_ms
+        self.max_fingerprint_points = max_fingerprint_points
+        self.min_fingerprint_points = min_fingerprint_points
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        if ctx.signals.get("pointer_type") in ("touch", "pen"):
+            return RiskContribution(suspicion=None, detail="touch/pen -- no trajectory to check")
+        fingerprint = fingerprint_trajectory(
+            ctx.signals.get("mouse_trajectory"),
+            grid_px=self.grid_px,
+            grid_ms=self.grid_ms,
+            max_points=self.max_fingerprint_points,
+            min_points=self.min_fingerprint_points,
+        )
+        if fingerprint is None:
+            return RiskContribution(suspicion=None, detail="no usable trajectory")
+        if await self.store.seen_recently(fingerprint):
+            return RiskContribution(
+                suspicion=1.0,
+                hard_override=self.override_level,
+                detail="this movement pattern was already used for a verification recently",
+            )
+        return RiskContribution(suspicion=0.0)
 
 
 class RunningRiskStore(Protocol):

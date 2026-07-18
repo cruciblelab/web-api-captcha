@@ -34,6 +34,7 @@ from webapi_captcha.adaptive import (
 )
 from webapi_captcha.api import build_captcha_router
 from webapi_captcha.base import CaptchaProvider, CaptchaStore, VerificationStore
+from webapi_captcha.beacon import DEFAULT_BEACON_MOUNT_PATH, build_passive_risk_beacon_router
 from webapi_captcha.checks import (
     AccountMatchCheck,
     CaptchaCheck,
@@ -65,6 +66,10 @@ from webapi_captcha.providers.recaptcha import ReCaptchaProvider
 from webapi_captcha.providers.text_captcha import TextCaptchaProvider
 from webapi_captcha.providers.turnstile import TurnstileProvider
 from webapi_captcha.replay_guard import (
+    DEFAULT_GRID_MS,
+    DEFAULT_GRID_PX,
+    DEFAULT_MAX_FINGERPRINT_POINTS,
+    DEFAULT_MIN_FINGERPRINT_POINTS,
     MemoryTrajectoryFingerprintStore,
     RepeatedMovementCheck,
     TrajectoryFingerprintStore,
@@ -73,7 +78,9 @@ from webapi_captcha.replay_guard import (
 from webapi_captcha.reputation import IPReputationChecker, StaticBlocklistReputationChecker
 from webapi_captcha.risk import (
     BehaviorScoreRiskSignal,
+    CorroboratedRiskSignal,
     MemoryRunningRiskStore,
+    ReplayRiskSignal,
     ReputationRiskSignal,
     RiskAssessment,
     RiskContext,
@@ -112,9 +119,14 @@ if TYPE_CHECKING:
 __version__ = "0.1.0"
 
 __all__ = [
+    "DEFAULT_BEACON_MOUNT_PATH",
     "DEFAULT_COOKIE_MAX_AGE",
     "DEFAULT_COOKIE_NAME",
+    "DEFAULT_GRID_MS",
+    "DEFAULT_GRID_PX",
     "DEFAULT_HEADLESS_UA_PATTERNS",
+    "DEFAULT_MAX_FINGERPRINT_POINTS",
+    "DEFAULT_MIN_FINGERPRINT_POINTS",
     "DEFAULT_WIDGET_MOUNT_PATH",
     "EVENT_TYPE_CAPTCHA_VERIFIED",
     "AccountMatchCheck",
@@ -131,6 +143,7 @@ __all__ = [
     "CheckOutcome",
     "CheckResult",
     "CloudflareStyleGuard",
+    "CorroboratedRiskSignal",
     "Event",
     "FallbackCaptchaProvider",
     "HCaptchaProvider",
@@ -151,6 +164,7 @@ __all__ = [
     "ProofOfWorkProvider",
     "ReCaptchaProvider",
     "RepeatedMovementCheck",
+    "ReplayRiskSignal",
     "ReputationRiskSignal",
     "RiskAssessment",
     "RiskContext",
@@ -180,6 +194,7 @@ __all__ = [
     "build_captcha_router",
     "build_captcha_widget_router",
     "build_cloudflare_style_guard",
+    "build_passive_risk_beacon_router",
     "build_passive_risk_router",
     "default_behavior_heuristics",
     "fingerprint_trajectory",
