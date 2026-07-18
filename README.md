@@ -1,5 +1,12 @@
 # webapi-captcha
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-005571?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
+⭐ If you find this useful, consider starring the repo -- it helps others
+discover it.
+
 A pluggable, adaptive human-verification/captcha layer for FastAPI.
 
 We designed it framework-only -- no assumption about who's connecting,
