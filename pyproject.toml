@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "webapi-captcha"
+version = "0.1.0"
+description = "A pluggable, adaptive human-verification/captcha layer for FastAPI -- IP-reputation-driven escalation, behavioral scoring, replay detection, self-hosted and third-party captcha providers. Framework-only, no assumption about who's connecting (Discord, a plain web app, or anything else)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "cruciblelab" }]
+keywords = ["captcha", "fastapi", "bot-detection", "human-verification", "cloudflare"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.110",
+  "pydantic>=2.0",
+  "httpx>=0.27",
+  "cryptography>=42",
+]
+
+[project.optional-dependencies]
+# webapi_captcha.sql works against any SQLAlchemy AsyncEngine -- these
+# extras just get the right async DBAPI driver installed. Pick the one(s)
+# matching your database; `sql` pulls in all three for convenience.
+sql-sqlite = ["sqlalchemy[asyncio]>=2.0", "aiosqlite>=0.20"]
+sql-postgres = ["sqlalchemy[asyncio]>=2.0", "asyncpg>=0.29"]
+sql-mysql = ["sqlalchemy[asyncio]>=2.0", "aiomysql>=0.2"]
+sql = ["webapi-captcha[sql-sqlite,sql-postgres,sql-mysql]"]
+# Only needed for the self-hosted image providers (MathCaptchaProvider/
+# TextCaptchaProvider) to render a distorted PNG. The third-party providers
+# (ReCaptchaProvider/HCaptchaProvider/TurnstileProvider) need only httpx,
+# already a core dependency -- no extra required for those.
+render = ["Pillow>=10.1"]
+all = ["webapi-captcha[sql,render]"]
+dev = [
+  "webapi-captcha[all]",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "respx>=0.21",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.urls]
+Repository = "https://github.com/cruciblelab/web-api-captcha"
+
+[tool.hatch.build.targets.wheel]
+packages = ["webapi_captcha"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's Depends()/Security() are meant to be called in argument
+# defaults -- that's the framework's own dependency-injection idiom, not a
+# mutable-default-argument bug.
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["webapi_captcha"]
