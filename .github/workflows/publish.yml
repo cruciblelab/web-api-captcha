@@ -28,7 +28,6 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       # Required for PyPI's Trusted Publishing (OIDC) -- no API token
       # stored in repo secrets.
