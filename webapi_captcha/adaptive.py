@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -44,6 +44,7 @@ from webapi_captcha.events import EVENT_TYPE_CAPTCHA_VERIFIED, CaptchaVerified
 from webapi_captcha.gate import CheckResult
 from webapi_captcha.models import CaptchaChallenge, VerificationRequest
 from webapi_captcha.reputation import IPReputationChecker
+from webapi_captcha.risk import RiskAssessment, RiskContext, RiskEngine, RiskLevel, RunningRiskStore
 from webapi_captcha.transport import Event, Transport
 
 
@@ -56,6 +57,14 @@ class AdaptiveDecision(BaseModel):
 
     requires_captcha: bool
     challenge: CaptchaChallenge | None = None
+    # Which RiskLevel this decision was made at -- lets `verify()` pick
+    # the matching tier's provider via `escalation_provider_for()`
+    # instead of always using the single default `escalation_provider`.
+    # Defaults to MINIMAL for decisions made before this field existed
+    # (an old SQL row, or a `risk_engine=None` legacy decision) -- those
+    # always resolve to `escalation_provider` either way, so the default
+    # is never wrong for them.
+    level: RiskLevel = RiskLevel.MINIMAL
 
 
 class AdaptiveDecisionStore(Protocol):
@@ -180,6 +189,12 @@ class AdaptiveCaptchaGate:
         trust_ttl: timedelta = timedelta(hours=24),
         bind_trust_to_ip: bool = False,
         ttl: timedelta = timedelta(minutes=15),
+        risk_engine: RiskEngine | None = None,
+        min_level_for_challenge: RiskLevel = RiskLevel.ELEVATED,
+        escalation_providers: Mapping[RiskLevel, CaptchaProvider] | None = None,
+        min_level_by_purpose: dict[str, RiskLevel] | None = None,
+        running_risk_store: RunningRiskStore | None = None,
+        running_risk_ttl: timedelta = timedelta(minutes=30),
     ) -> None:
         self.transport = transport
         self.store = store
@@ -192,6 +207,17 @@ class AdaptiveCaptchaGate:
         self.trust_ttl = trust_ttl
         self.bind_trust_to_ip = bind_trust_to_ip
         self.ttl = ttl
+        # Everything below is optional and additive -- `risk_engine=None`
+        # (the default) means `assess_risk()` reduces to exactly the
+        # `reputation.is_suspicious(client_ip)` check this class always
+        # made, byte for byte. See `webapi_captcha.risk` for the richer
+        # multi-signal path.
+        self.risk_engine = risk_engine
+        self.min_level_for_challenge = min_level_for_challenge
+        self.escalation_providers = dict(escalation_providers or {})
+        self.min_level_by_purpose = dict(min_level_by_purpose or {})
+        self.running_risk_store = running_risk_store
+        self.running_risk_ttl = running_risk_ttl
         # Per-token locks -- two concurrent calls for the SAME token (a
         # double page load, a client retry, two open tabs) used to race
         # on both `_resolve_decision` (each could see no decision stored
@@ -223,6 +249,75 @@ class AdaptiveCaptchaGate:
         return await self.trust_store.is_trusted(
             user_id, ip=client_ip if self.bind_trust_to_ip else None
         )
+
+    async def assess_risk(
+        self,
+        *,
+        client_ip: str | None,
+        user_id: int | None = None,
+        purpose: str | None = None,
+        route: str | None = None,
+        signals: dict[str, Any] | None = None,
+        min_level: RiskLevel = RiskLevel.MINIMAL,
+    ) -> RiskAssessment:
+        """The one place the "how suspicious is this" decision is made,
+        so `PageGuard`'s pre-page-load check and `verify()`'s
+        post-signals check share it instead of independently
+        reimplementing (and risking disagreeing on) the same logic.
+
+        Layers three things on top of whatever `risk_engine` itself
+        computes, so every caller gets them applied uniformly without
+        having to remember to look them up itself: `min_level` (the
+        CALLER's own floor -- e.g. a specific route's own extra
+        requirement), `min_level_by_purpose` (a per-`purpose` floor
+        configured once on this gate), and `running_risk_store` (a
+        visitor's own accumulated risk from earlier requests -- see
+        `webapi_captcha.risk.RunningRiskStore`). A floor can only ever
+        raise the resulting level, never lower it.
+
+        Falls back to exactly `reputation.is_suspicious(client_ip)`,
+        mapped onto `RiskLevel.HIGH`/`RiskLevel.MINIMAL`, when
+        `risk_engine` is `None` -- byte-for-byte the same decision this
+        class always made before `risk_engine` existed."""
+        floor = min_level
+        if purpose is not None:
+            floor = max(floor, self.min_level_by_purpose.get(purpose, RiskLevel.MINIMAL))
+        if self.running_risk_store is not None and user_id is not None:
+            running = await self.running_risk_store.get(user_id)
+            if running is not None:
+                floor = max(floor, running)
+
+        if self.risk_engine is None:
+            suspicious = client_ip is not None and await self.reputation.is_suspicious(client_ip)
+            level = max(floor, RiskLevel.HIGH if suspicious else RiskLevel.MINIMAL)
+            return RiskAssessment(
+                level=level, suspicion=1.0 if suspicious else 0.0, contributions={}
+            )
+
+        assessment = await self.risk_engine.assess(
+            RiskContext(
+                client_ip=client_ip,
+                user_id=user_id,
+                purpose=purpose,
+                route=route,
+                signals=signals or {},
+            )
+        )
+        if floor > assessment.level:
+            assessment = RiskAssessment(
+                level=floor,
+                suspicion=assessment.suspicion,
+                contributions=assessment.contributions,
+                override_signal=assessment.override_signal,
+            )
+        return assessment
+
+    def escalation_provider_for(self, level: RiskLevel) -> CaptchaProvider:
+        """`escalation_providers.get(level, escalation_provider)` -- the
+        per-tier provider if one was configured for this level, else the
+        single default. The common single-provider case needs to
+        configure nothing here at all."""
+        return self.escalation_providers.get(level, self.escalation_provider)
 
     async def create_verification(
         self,
@@ -316,7 +411,9 @@ class AdaptiveCaptchaGate:
                 if request.verified:
                     return CheckResult(verified=True, passed=[])
 
-                decision = await self._resolve_decision_locked(token, request, client_ip)
+                decision = await self._resolve_decision_locked(
+                    token, request, client_ip, signals=signals
+                )
                 # The check that reads ctx.request.challenge (CaptchaCheck)
                 # needs it there -- AdaptiveDecision is kept in its own
                 # store rather than mutated onto the shared
@@ -329,7 +426,7 @@ class AdaptiveCaptchaGate:
                     checks.append(AccountMatchCheck())
                 checks.extend(self.extra_checks)
                 if decision.requires_captcha:
-                    checks.append(CaptchaCheck(self.escalation_provider))
+                    checks.append(CaptchaCheck(self.escalation_provider_for(decision.level)))
 
                 ctx = VerificationContext(
                     request=request,
@@ -393,7 +490,12 @@ class AdaptiveCaptchaGate:
         self.transport.subscribe(EVENT_TYPE_CAPTCHA_VERIFIED, _wrapped)
 
     async def _resolve_decision(
-        self, token: str, request: VerificationRequest, client_ip: str | None
+        self,
+        token: str,
+        request: VerificationRequest,
+        client_ip: str | None,
+        *,
+        signals: dict[str, Any] | None = None,
     ) -> AdaptiveDecision:
         """Acquires this token's lock itself -- for callers (`get_info`)
         that don't already hold it. `verify()` holds the lock for its
@@ -404,12 +506,19 @@ class AdaptiveCaptchaGate:
         lock = self._token_locks.setdefault(token, asyncio.Lock())
         try:
             async with lock:
-                return await self._resolve_decision_locked(token, request, client_ip)
+                return await self._resolve_decision_locked(
+                    token, request, client_ip, signals=signals
+                )
         finally:
             self._token_locks.pop(token, None)
 
     async def _resolve_decision_locked(
-        self, token: str, request: VerificationRequest, client_ip: str | None
+        self,
+        token: str,
+        request: VerificationRequest,
+        client_ip: str | None,
+        *,
+        signals: dict[str, Any] | None = None,
     ) -> AdaptiveDecision:
         existing = await self.decision_store.get(token)
         if existing is not None:
@@ -419,12 +528,22 @@ class AdaptiveCaptchaGate:
 
         requires_captcha = False
         challenge = None
-        if not trusted and client_ip is not None:
-            requires_captcha = await self.reputation.is_suspicious(client_ip)
+        level = RiskLevel.MINIMAL
+        if not trusted:
+            assessment = await self.assess_risk(
+                client_ip=client_ip,
+                user_id=request.user_id,
+                purpose=request.purpose,
+                signals=signals,
+            )
+            level = assessment.level
+            requires_captcha = level >= self.min_level_for_challenge
             if requires_captcha:
-                challenge = await self.escalation_provider.issue()
+                challenge = await self.escalation_provider_for(level).issue()
 
-        decision = AdaptiveDecision(requires_captcha=requires_captcha, challenge=challenge)
+        decision = AdaptiveDecision(
+            requires_captcha=requires_captcha, challenge=challenge, level=level
+        )
         await self.decision_store.set(token, decision)
         # Re-read rather than trust our own locally-computed `decision`:
         # across web replicas (separate processes, so this class's own

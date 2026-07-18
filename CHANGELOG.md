@@ -4,6 +4,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **`RiskEngine`** (`webapi_captcha.risk`, new module): a multi-signal,
+  tiered replacement for `AdaptiveCaptchaGate`/`PageGuard`'s previous
+  single binary "IP suspicious or not" decision, entirely additive
+  (`risk_engine=None` keeps the exact old behavior). Combines IP
+  reputation (`ReputationRiskSignal`), behavioral scoring
+  (`BehaviorScoreRiskSignal`, wrapping `SignalScoreCheck`), and any
+  custom `RiskSignal` into one ordered `RiskLevel`
+  (`MINIMAL`/`LOW`/`ELEVATED`/`HIGH`). Three concrete new capabilities:
+  a bad IP `hard_override`s straight to the strongest configured tier
+  instead of being averaged away; `min_level_by_purpose` (and
+  `PageGuard.require_human(..., min_level=...)`) lets a specific
+  route/purpose demand extra scrutiny even on a clean IP; a new
+  `RunningRiskStore` (`MemoryRunningRiskStore`/`SQLRunningRiskStore`) +
+  `build_passive_risk_router()` lets passive signals collected *after* a
+  visitor has already entered a guarded page still escalate them on a
+  later request (a level only ever rises within its TTL, never drops).
+  `escalation_providers: Mapping[RiskLevel, CaptchaProvider]` lets each
+  tier use a different provider -- self-hosted for the low tiers,
+  reCAPTCHA/hCaptcha/Turnstile only for the tier that's actually
+  suspicious enough to be worth the third-party round trip.
 - **`LoadAdaptiveDifficulty`** for `ProofOfWorkProvider`: pass it instead
   of a plain `int` difficulty to get mCaptcha-style load-adaptive PoW —
   difficulty tracks the recent rate of issued challenges and rises

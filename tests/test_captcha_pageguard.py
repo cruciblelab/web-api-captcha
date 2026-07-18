@@ -3,6 +3,7 @@
 primitive built on `AdaptiveCaptchaGate`.
 """
 
+from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, Request
@@ -11,21 +12,28 @@ from fastapi.testclient import TestClient
 
 from webapi_captcha import (
     AdaptiveCaptchaGate,
+    BehaviorScoreRiskSignal,
     MathCaptchaProvider,
     MemoryAdaptiveDecisionStore,
     MemoryCaptchaStore,
+    MemoryRunningRiskStore,
     MemoryTrustStore,
     MemoryVerificationStore,
     PageGuard,
     PageGuardRedirect,
+    RiskEngine,
+    RiskLevel,
     StaticBlocklistReputationChecker,
+    build_passive_risk_router,
     missing_accept_language,
     suspicious_user_agent,
 )
 from webapi_captcha.transport import InProcessTransport
 
 
-def _build_app(**guard_kwargs: object) -> tuple[FastAPI, PageGuard, AdaptiveCaptchaGate]:
+def _build_app(
+    gate_kwargs: dict[str, object] | None = None, **guard_kwargs: object
+) -> tuple[FastAPI, PageGuard, AdaptiveCaptchaGate]:
     transport = InProcessTransport()
     blocklist = StaticBlocklistReputationChecker(blocked_ips={"9.9.9.9"})
     captcha_store = MemoryCaptchaStore()
@@ -37,6 +45,7 @@ def _build_app(**guard_kwargs: object) -> tuple[FastAPI, PageGuard, AdaptiveCapt
         MemoryAdaptiveDecisionStore(),
         trust_store=MemoryTrustStore(),
         bind_trust_to_ip=True,
+        **(gate_kwargs or {}),  # type: ignore[arg-type]
     )
     guard = PageGuard(
         gate,
@@ -208,3 +217,73 @@ def test_a_different_ip_is_not_covered_by_trust_earned_on_another_ip() -> None:
     fresh_client_same_blocked_ip = TestClient(app, client=("9.9.9.9", 55555))
     resp = fresh_client_same_blocked_ip.get("/protected", follow_redirects=False)
     assert resp.status_code == 307
+
+
+def test_default_min_level_redirects_even_on_a_clean_ip() -> None:
+    app, _guard, _gate = _build_app(default_min_level=RiskLevel.ELEVATED)
+    client = TestClient(app, client=("1.1.1.1", 12345))  # not on any blocklist
+
+    resp = client.get("/protected", follow_redirects=False)
+
+    assert resp.status_code == 307
+
+
+def test_running_risk_store_escalates_a_later_page_load() -> None:
+    """The flagship proof of the "background/passive signals collected
+    after a visitor has already entered a guarded page can still trigger
+    escalation" requirement: page 1 from a clean IP passes; the
+    visitor's running risk is bumped (simulating what
+    build_passive_risk_router would have done from posted signals); page
+    2, same cookie, same clean IP, now redirects."""
+    running_risk_store = MemoryRunningRiskStore()
+    app, guard, gate = _build_app(
+        gate_kwargs={"risk_engine": RiskEngine([]), "running_risk_store": running_risk_store}
+    )
+    client = TestClient(app, client=("1.1.1.1", 12345))
+
+    first = client.get("/protected", follow_redirects=False)
+    assert first.status_code == 200
+    visitor_cookie = first.cookies[guard.cookie_name]
+
+    import asyncio
+
+    from webapi_captcha.pageguard import _pseudo_user_id
+
+    visitor_id = _pseudo_user_id(visitor_cookie)
+    asyncio.run(running_risk_store.bump(visitor_id, RiskLevel.HIGH, ttl=timedelta(minutes=5)))
+
+    second = client.get("/protected", follow_redirects=False)
+    assert second.status_code == 307
+
+
+def test_passive_signal_endpoint_bumps_risk_and_a_later_page_load_redirects() -> None:
+    """True end-to-end version of the test above, through the actual
+    build_passive_risk_router endpoint instead of bumping the store
+    directly."""
+    running_risk_store = MemoryRunningRiskStore()
+    app, guard, gate = _build_app(
+        gate_kwargs={
+            "risk_engine": RiskEngine([BehaviorScoreRiskSignal()]),
+            "running_risk_store": running_risk_store,
+        }
+    )
+    app.include_router(build_passive_risk_router(guard))
+    client = TestClient(app, client=("1.1.1.1", 12345))
+
+    first = client.get("/protected", follow_redirects=False)
+    assert first.status_code == 200
+
+    # webdriver=True scores low human-likeness -> high suspicion.
+    resp = client.post("/api/captcha/passive-signal", json={"signals": {"webdriver": True}})
+    assert resp.status_code == 200
+    assert resp.json()["level"] in ("elevated", "high")
+
+    second = client.get("/protected", follow_redirects=False)
+    assert second.status_code == 307
+
+
+def test_passive_signal_endpoint_404s_without_risk_engine_or_running_risk_store() -> None:
+    _app, guard, _gate = _build_app()  # no risk_engine/running_risk_store configured
+    router = build_passive_risk_router(guard)
+
+    assert router.routes == []

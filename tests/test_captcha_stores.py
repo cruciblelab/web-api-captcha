@@ -12,10 +12,12 @@ from sqlalchemy.pool import StaticPool
 from webapi_captcha.adaptive import AdaptiveDecision
 from webapi_captcha.memory import MemoryCaptchaStore, MemoryVerificationStore
 from webapi_captcha.models import CaptchaChallenge, PendingCaptcha, VerificationRequest
+from webapi_captcha.risk import RiskLevel
 from webapi_captcha.sql import (
     PendingCaptchaRow,
     SQLAdaptiveDecisionStore,
     SQLCaptchaStore,
+    SQLRunningRiskStore,
     SQLTrajectoryFingerprintStore,
     SQLTrustStore,
     SQLVerificationStore,
@@ -581,3 +583,74 @@ async def test_sql_trust_store_purge_expired(engine: AsyncEngine) -> None:
 
     assert deleted == 1
     assert await store.is_trusted(2) is True
+
+
+# -- SQLRunningRiskStore --
+
+
+async def test_sql_running_risk_store_unseen_visitor_returns_none(engine: AsyncEngine) -> None:
+    store = SQLRunningRiskStore(engine)
+    await store.create_all()
+
+    assert await store.get(1) is None
+
+
+async def test_sql_running_risk_store_bump_raises_but_never_lowers(engine: AsyncEngine) -> None:
+    store = SQLRunningRiskStore(engine)
+    await store.create_all()
+
+    result = await store.bump(1, RiskLevel.ELEVATED, ttl=timedelta(minutes=5))
+    assert result == RiskLevel.ELEVATED
+    assert await store.get(1) == RiskLevel.ELEVATED
+
+    result = await store.bump(1, RiskLevel.LOW, ttl=timedelta(minutes=5))
+    assert result == RiskLevel.ELEVATED
+
+    result = await store.bump(1, RiskLevel.HIGH, ttl=timedelta(minutes=5))
+    assert result == RiskLevel.HIGH
+
+
+async def test_sql_running_risk_store_expires(engine: AsyncEngine) -> None:
+    store = SQLRunningRiskStore(engine)
+    await store.create_all()
+
+    await store.bump(1, RiskLevel.HIGH, ttl=timedelta(seconds=-1))
+
+    assert await store.get(1) is None
+    # Bumping again after expiry starts fresh rather than maxing against
+    # the stale value.
+    result = await store.bump(1, RiskLevel.LOW, ttl=timedelta(minutes=5))
+    assert result == RiskLevel.LOW
+
+
+async def test_sql_running_risk_store_purge_expired(engine: AsyncEngine) -> None:
+    store = SQLRunningRiskStore(engine)
+    await store.create_all()
+    await store.bump(1, RiskLevel.HIGH, ttl=timedelta(seconds=-1))
+    await store.bump(2, RiskLevel.HIGH, ttl=timedelta(hours=1))
+
+    deleted = await store.purge_expired()
+
+    assert deleted == 1
+    assert await store.get(2) == RiskLevel.HIGH
+
+
+async def test_sql_running_risk_store_concurrent_first_bump_does_not_crash(
+    tmp_path: object,
+) -> None:
+    """Same first-write-wins race as `SQLTrustStore`'s equivalent test --
+    real file-backed engine, not `:memory:`+StaticPool."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    file_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/running_risk.sqlite3")  # type: ignore[arg-type]
+    store = SQLRunningRiskStore(file_engine)
+    await store.create_all()
+
+    await asyncio.gather(
+        *(store.bump(1, RiskLevel.ELEVATED, ttl=timedelta(hours=1)) for _ in range(10))
+    )
+
+    assert await store.get(1) == RiskLevel.ELEVATED
+    await file_engine.dispose()

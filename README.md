@@ -203,6 +203,52 @@ complete with a visitor cookie so a verified visitor isn't asked again
 (optionally bound to the same connecting IP). `presets.build_cloudflare_style_guard()`
 wires up a sane default of both in one call.
 
+### Risk-tiered escalation (`RiskEngine`)
+
+By default the escalation decision above is a single binary question
+(IP reputation suspicious or not). Pass a `RiskEngine` for a richer,
+multi-signal version instead -- combine IP reputation
+(`ReputationRiskSignal`), behavioral scoring (`BehaviorScoreRiskSignal`,
+wrapping `SignalScoreCheck`), and any custom signal you write into one
+ordered `RiskLevel` (`MINIMAL`/`LOW`/`ELEVATED`/`HIGH`):
+
+```python
+from webapi_captcha import (
+    BehaviorScoreRiskSignal, ReputationRiskSignal, RiskEngine, RiskLevel,
+)
+
+risk_engine = RiskEngine([
+    ReputationRiskSignal(my_reputation_source),  # a bad IP hard-overrides to HIGH
+    BehaviorScoreRiskSignal(),                   # continuous, from posted signals
+])
+gate = AdaptiveCaptchaGate(
+    ..., risk_engine=risk_engine,
+    escalation_providers={RiskLevel.HIGH: turnstile_provider},  # a different/stricter
+    min_level_by_purpose={"checkout": RiskLevel.ELEVATED},      # provider per tier
+)
+```
+
+- **A bad IP skips straight to the strongest tier** -- `ReputationRiskSignal`
+  returns a `hard_override`, not a blended score, so it doesn't get
+  diluted by other signals looking clean.
+- **A specific route/purpose can demand extra scrutiny even on a clean
+  IP** -- `min_level_by_purpose` (or `PageGuard.require_human(...,
+  min_level=...)` per call) raises the floor regardless of the computed
+  score.
+- **Passive signals gathered after a visitor has already entered a
+  guarded page can still escalate them** -- pair a `RunningRiskStore`
+  (`MemoryRunningRiskStore`/`SQLRunningRiskStore`) with
+  `build_passive_risk_router()`: your frontend `POST`s accumulated
+  signals periodically, and every subsequent `PageGuard.require_human()`
+  call for that visitor picks up the new floor automatically (a level
+  only ever rises within its TTL, never drops). This is the "stop
+  calling reCAPTCHA/hCaptcha on every request" piece: this whole
+  decision runs first and for free, and only the challenge that a
+  configured tier actually needs (self-hosted or third-party) gets
+  called at all.
+- `risk_engine=None` (the default) keeps today's exact
+  `reputation.is_suspicious()` behavior -- this is entirely additive.
+
 ## Bundled widget
 
 An optional, ready UI on top of the raw endpoints -- one `<div>` + one

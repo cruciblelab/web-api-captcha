@@ -39,9 +39,13 @@ import secrets
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import Request
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
 
 from webapi_captcha.adaptive import AdaptiveCaptchaGate
+from webapi_captcha.api import CurrentUserIdResolver, _no_current_user
+from webapi_captcha.ratelimit import TokenBucketLimiter
+from webapi_captcha.risk import RiskLevel
 from webapi_captcha.signals import DEFAULT_HEADLESS_UA_PATTERNS
 
 DEFAULT_COOKIE_NAME = "wac_visitor_id"
@@ -117,6 +121,7 @@ class PageGuard:
         cookie_max_age: int = DEFAULT_COOKIE_MAX_AGE,
         purpose: str = "page_guard",
         extra_suspicious: Callable[[Request], bool] | None = None,
+        default_min_level: RiskLevel = RiskLevel.MINIMAL,
     ) -> None:
         self.gate = gate
         self.verify_url = verify_url
@@ -124,6 +129,7 @@ class PageGuard:
         self.cookie_max_age = cookie_max_age
         self.purpose = purpose
         self.extra_suspicious = extra_suspicious
+        self.default_min_level = default_min_level
 
     async def require_human(
         self,
@@ -131,6 +137,7 @@ class PageGuard:
         *,
         authenticated_user_id: int | None = None,
         metadata: dict[str, Any] | None = None,
+        min_level: RiskLevel | None = None,
     ) -> str | None:
         """Call at the top of a protected route. Raises `PageGuardRedirect`
         if this visitor needs to solve a captcha before proceeding.
@@ -156,11 +163,28 @@ class PageGuard:
         if await self.gate.is_currently_trusted(visitor_id, client_ip=client_ip):
             return new_cookie_value
 
-        suspicious = False
-        if client_ip is not None:
-            suspicious = await self.gate.reputation.is_suspicious(client_ip)
-        if not suspicious and self.extra_suspicious is not None:
-            suspicious = self.extra_suspicious(request)
+        floor = self.default_min_level
+        if min_level is not None:
+            floor = max(floor, min_level)
+        # Same short-circuit intent as before (skip the sync predicate
+        # once escalation is already decided some other way): now
+        # generalized from "IP reputation already flagged this" to "the
+        # floor from purpose/running-risk/explicit min_level already
+        # clears the challenge threshold" -- observably identical for
+        # every caller that doesn't combine those with extra_suspicious.
+        if floor < self.gate.min_level_for_challenge and self.extra_suspicious is not None:
+            if self.extra_suspicious(request):
+                floor = max(floor, self.gate.min_level_for_challenge)
+
+        assessment = await self.gate.assess_risk(
+            client_ip=client_ip,
+            user_id=visitor_id,
+            purpose=self.purpose,
+            route=request.url.path,
+            signals={},
+            min_level=floor,
+        )
+        suspicious = assessment.level >= self.gate.min_level_for_challenge
 
         if not suspicious:
             return new_cookie_value
@@ -212,3 +236,86 @@ def suspicious_user_agent(patterns: tuple[str, ...] | None = None) -> Callable[[
         return any(needle in ua for needle in needles)
 
     return _predicate
+
+
+_DEFAULT_PASSIVE_LIMITER = TokenBucketLimiter(max_calls=6, per_seconds=60.0)
+
+
+class PassiveSignalBody(BaseModel):
+    signals: dict[str, Any] = {}
+
+
+class PassiveSignalResult(BaseModel):
+    level: str  # RiskLevel member name, lowercased -- informational only today
+
+
+def build_passive_risk_router(
+    guard: PageGuard,
+    *,
+    mount_path: str = "/api/captcha/passive-signal",
+    current_user_id_resolver: CurrentUserIdResolver = _no_current_user,
+    rate_limiter: TokenBucketLimiter | None = None,
+) -> APIRouter:
+    """Feeds ongoing, passively-collected signals into a visitor's
+    RUNNING risk level (`guard.gate.running_risk_store`) *between* page
+    loads -- what `require_human()` consults on every subsequent request
+    via `assess_risk()`'s running-risk floor, so a visitor who looked
+    clean on their first page view can be escalated on a later one
+    without solving anything or waiting for IP reputation itself to
+    change. See `webapi_captcha.risk.RunningRiskStore` for why this is
+    monotonic (a level can only ever go up within its TTL).
+
+    Mounts nothing meaningful (an empty `APIRouter`) if
+    `guard.gate.risk_engine` or `guard.gate.running_risk_store` is
+    `None` -- this mechanism is opt-in additive and needs BOTH to mean
+    anything: an engine to turn signals into a level, a store to
+    remember that level between requests.
+
+    Frontend contract: `POST` here periodically (e.g. every N seconds,
+    on scroll milestones, or before unload) with whatever `signals` your
+    page has accumulated so far -- the same shape
+    `SignalScoreCheck`/the bundled widget already collect. This package
+    ships no beacon script of its own yet; wire your own small `POST`,
+    or extend `widget.js`'s existing signal collection to also fire here
+    on an interval -- that frontend piece is a separate, later addition
+    from this server-side contract.
+    """
+    router = APIRouter(tags=["captcha"])
+    limiter = rate_limiter or _DEFAULT_PASSIVE_LIMITER
+
+    if guard.gate.risk_engine is None or guard.gate.running_risk_store is None:
+        return router
+
+    @router.post(mount_path)
+    async def report_passive_signal(
+        body: PassiveSignalBody,
+        request: Request,
+        authenticated_user_id: int | None = Depends(current_user_id_resolver),
+    ) -> PassiveSignalResult:
+        client_ip = request.client.host if request.client else "unknown"
+        limiter.check(client_ip)
+
+        if authenticated_user_id is not None:
+            visitor_id = authenticated_user_id
+        else:
+            raw = request.cookies.get(guard.cookie_name)
+            if raw is None:
+                # No cookie yet -- this endpoint never mints one (only
+                # require_human() does, on a real page load); nothing to
+                # attribute this signal to.
+                return PassiveSignalResult(level=RiskLevel.MINIMAL.name.lower())
+            visitor_id = _pseudo_user_id(raw)
+
+        assessment = await guard.gate.assess_risk(
+            client_ip=request.client.host if request.client else None,
+            user_id=visitor_id,
+            purpose=guard.purpose,
+            signals=body.signals,
+        )
+        assert guard.gate.running_risk_store is not None  # guarded by the early return above
+        new_level = await guard.gate.running_risk_store.bump(
+            visitor_id, assessment.level, ttl=guard.gate.running_risk_ttl
+        )
+        return PassiveSignalResult(level=new_level.name.lower())
+
+    return router

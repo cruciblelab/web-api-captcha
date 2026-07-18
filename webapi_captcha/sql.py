@@ -30,6 +30,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from webapi_captcha.adaptive import AdaptiveDecision
 from webapi_captcha.models import CaptchaChallenge, PendingCaptcha, VerificationRequest
+from webapi_captcha.risk import RiskLevel
 
 _TIMESTAMP = DateTime(timezone=True)
 
@@ -416,6 +417,11 @@ class AdaptiveDecisionRow(Base):
     token: Mapped[str] = mapped_column(String(64), primary_key=True)
     requires_captcha: Mapped[bool] = mapped_column(Boolean)
     challenge_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Defaults to 0 (RiskLevel.MINIMAL) for rows written before this
+    # column existed -- always the right value for those, since a
+    # pre-risk-engine decision only ever used `escalation_provider`
+    # (the same one `escalation_provider_for(MINIMAL)` falls back to).
+    level: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SQLAdaptiveDecisionStore:
@@ -444,6 +450,7 @@ class SQLAdaptiveDecisionStore:
                     if row.challenge_json is not None
                     else None
                 ),
+                level=RiskLevel(row.level),
             )
 
     async def set(self, token: str, decision: AdaptiveDecision) -> None:
@@ -472,6 +479,7 @@ class SQLAdaptiveDecisionStore:
                     token=token,
                     requires_captcha=decision.requires_captcha,
                     challenge_json=challenge_json,
+                    level=int(decision.level),
                 )
             )
             try:
@@ -552,6 +560,87 @@ class SQLTrustStore:
                 CursorResult[Any],
                 await db.execute(
                     delete(TrustRow).where(TrustRow.trusted_until <= datetime.now(UTC))
+                ),
+            )
+            await db.commit()
+            return result.rowcount or 0
+
+
+class RunningRiskRow(Base):
+    __tablename__ = "wac_captcha_running_risk"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    level: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(_TIMESTAMP)
+
+
+class SQLRunningRiskStore:
+    """`RunningRiskStore` backed by SQLAlchemy 2.0 async -- the
+    multi-process-safe version of `MemoryRunningRiskStore`.
+
+    `bump()`'s concurrency story is simpler than
+    `SQLAdaptiveDecisionStore.set()`'s: taking the max of two
+    concurrently-computed levels is commutative and idempotent (there's
+    no "which challenge did we agree on" problem, just "what's the
+    highest level anyone's observed for this user right now") -- so a
+    plain read-modify-write guarded by `_commit_upsert` on conflict is
+    enough."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+        self._sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def create_all(self) -> None:
+        async with self._engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def get(self, user_id: int) -> RiskLevel | None:
+        async with self._sessionmaker() as db:
+            row = await db.get(RunningRiskRow, user_id)
+            if row is None:
+                return None
+            if _as_utc(row.expires_at) <= datetime.now(UTC):
+                await db.delete(row)
+                await db.commit()
+                return None
+            return RiskLevel(row.level)
+
+    async def bump(self, user_id: int, level: RiskLevel, *, ttl: timedelta) -> RiskLevel:
+        expires_at = datetime.now(UTC) + ttl
+
+        async with self._sessionmaker() as db:
+            row = await db.get(RunningRiskRow, user_id)
+            if row is not None and _as_utc(row.expires_at) <= datetime.now(UTC):
+                await db.delete(row)
+                await db.commit()
+                row = None
+
+            new_level = level if row is None else RiskLevel(max(row.level, int(level)))
+
+            def _apply(existing: RunningRiskRow) -> None:
+                existing.level = int(new_level)
+                existing.expires_at = expires_at
+
+            is_new = row is None
+            if row is None:
+                row = RunningRiskRow(user_id=user_id, level=int(new_level), expires_at=expires_at)
+                db.add(row)
+            else:
+                _apply(row)
+            await _commit_upsert(
+                db,
+                is_new=is_new,
+                get_existing=lambda: db.get(RunningRiskRow, user_id),
+                apply_fields=_apply,
+            )
+            return new_level
+
+    async def purge_expired(self) -> int:
+        async with self._sessionmaker() as db:
+            result = cast(
+                CursorResult[Any],
+                await db.execute(
+                    delete(RunningRiskRow).where(RunningRiskRow.expires_at <= datetime.now(UTC))
                 ),
             )
             await db.commit()

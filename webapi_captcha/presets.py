@@ -20,7 +20,7 @@ yourself for full control; nothing else in this package depends on it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -43,6 +43,7 @@ from webapi_captcha.pageguard import (
 )
 from webapi_captcha.providers.path_trace import PathTraceProvider
 from webapi_captcha.reputation import IPReputationChecker, StaticBlocklistReputationChecker
+from webapi_captcha.risk import RiskEngine, RiskLevel, RunningRiskStore
 from webapi_captcha.scoring import SignalScoreCheck
 from webapi_captcha.transport import Transport
 
@@ -79,6 +80,13 @@ def build_cloudflare_style_guard(
     cookie_name: str = DEFAULT_COOKIE_NAME,
     cookie_max_age: int = DEFAULT_COOKIE_MAX_AGE,
     ttl: timedelta = timedelta(minutes=15),
+    risk_engine: RiskEngine | None = None,
+    min_level_for_challenge: RiskLevel = RiskLevel.ELEVATED,
+    escalation_providers: Mapping[RiskLevel, CaptchaProvider] | None = None,
+    min_level_by_purpose: dict[str, RiskLevel] | None = None,
+    running_risk_store: RunningRiskStore | None = None,
+    running_risk_ttl: timedelta = timedelta(minutes=30),
+    default_min_level: RiskLevel = RiskLevel.MINIMAL,
 ) -> CloudflareStyleGuard:
     """Every argument defaults to something that runs with zero external
     setup, so you can call this with only `transport` and `verify_url`
@@ -127,6 +135,12 @@ def build_cloudflare_style_guard(
         trust_ttl=trust_ttl,
         bind_trust_to_ip=bind_trust_to_ip,
         ttl=ttl,
+        risk_engine=risk_engine,
+        min_level_for_challenge=min_level_for_challenge,
+        escalation_providers=escalation_providers,
+        min_level_by_purpose=min_level_by_purpose,
+        running_risk_store=running_risk_store,
+        running_risk_ttl=running_risk_ttl,
     )
     guard = PageGuard(
         gate,
@@ -135,5 +149,6 @@ def build_cloudflare_style_guard(
         cookie_max_age=cookie_max_age,
         purpose=purpose,
         extra_suspicious=extra_suspicious,
+        default_min_level=default_min_level,
     )
     return CloudflareStyleGuard(page_guard=guard, gate=gate)

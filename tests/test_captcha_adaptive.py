@@ -13,8 +13,31 @@ from webapi_captcha.adaptive import (
 from webapi_captcha.checks import PredicateCheck, VerificationContext
 from webapi_captcha.memory import MemoryCaptchaStore, MemoryVerificationStore
 from webapi_captcha.providers.math_captcha import MathCaptchaProvider
+from webapi_captcha.providers.path_trace import PathTraceProvider
 from webapi_captcha.reputation import StaticBlocklistReputationChecker
+from webapi_captcha.risk import (
+    MemoryRunningRiskStore,
+    RiskContext,
+    RiskContribution,
+    RiskEngine,
+    RiskLevel,
+)
 from webapi_captcha.transport import InProcessTransport
+
+
+class _OverrideSignal:
+    """A RiskSignal that always hard-overrides to a fixed level -- used
+    to simulate "IP reputation is outright bad" without depending on
+    ReputationRiskSignal's own tests."""
+
+    name = "override"
+    weight = 1.0
+
+    def __init__(self, level: RiskLevel) -> None:
+        self.level = level
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        return RiskContribution(suspicion=1.0, hard_override=self.level)
 
 
 def _make_gate(**kwargs: object) -> AdaptiveCaptchaGate:
@@ -341,3 +364,52 @@ async def test_missing_client_ip_is_treated_as_not_suspicious() -> None:
 
     assert info is not None
     assert info["requires_captcha"] is False
+
+
+async def test_risk_engine_hard_override_issues_from_the_tiered_provider() -> None:
+    """A hard_override to HIGH should escalate via the HIGH-tier provider
+    (a different one from the plain default), not the single default
+    escalation_provider -- the "IP reputation is outright bad, skip
+    straight to the strongest configured response" case."""
+    strict_store = MemoryCaptchaStore()
+    strict_provider = PathTraceProvider(strict_store)
+    gate = _make_gate(
+        risk_engine=RiskEngine([_OverrideSignal(RiskLevel.HIGH)]),
+        escalation_providers={RiskLevel.HIGH: strict_provider},
+    )
+    request = await gate.create_verification(user_id=100, purpose="signup")
+
+    info = await gate.get_info(request.token, client_ip="9.9.9.9")  # clean IP -- irrelevant now
+
+    assert info is not None
+    assert info["requires_captcha"] is True
+    assert info["challenge"] is not None
+    assert info["challenge"].kind == strict_provider.kind
+
+
+async def test_min_level_by_purpose_forces_escalation_on_a_clean_ip() -> None:
+    gate = _make_gate(
+        risk_engine=RiskEngine([]),  # no signals at all -> would otherwise be MINIMAL
+        min_level_by_purpose={"checkout": RiskLevel.ELEVATED},
+    )
+    request = await gate.create_verification(user_id=100, purpose="checkout")
+
+    info = await gate.get_info(request.token, client_ip="9.9.9.9")
+
+    assert info is not None
+    assert info["requires_captcha"] is True
+
+
+async def test_running_risk_store_floor_escalates_a_fresh_tokens_decision() -> None:
+    running_risk_store = MemoryRunningRiskStore()
+    gate = _make_gate(
+        risk_engine=RiskEngine([]),
+        running_risk_store=running_risk_store,
+    )
+    await running_risk_store.bump(100, RiskLevel.HIGH, ttl=timedelta(minutes=5))
+
+    request = await gate.create_verification(user_id=100, purpose="signup")
+    info = await gate.get_info(request.token, client_ip="9.9.9.9")  # clean IP
+
+    assert info is not None
+    assert info["requires_captcha"] is True

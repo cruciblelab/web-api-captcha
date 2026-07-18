@@ -51,6 +51,7 @@ from webapi_captcha.pageguard import (
     DEFAULT_COOKIE_NAME,
     PageGuard,
     PageGuardRedirect,
+    build_passive_risk_router,
     missing_accept_language,
     suspicious_user_agent,
 )
@@ -70,6 +71,18 @@ from webapi_captcha.replay_guard import (
     fingerprint_trajectory,
 )
 from webapi_captcha.reputation import IPReputationChecker, StaticBlocklistReputationChecker
+from webapi_captcha.risk import (
+    BehaviorScoreRiskSignal,
+    MemoryRunningRiskStore,
+    ReputationRiskSignal,
+    RiskAssessment,
+    RiskContext,
+    RiskContribution,
+    RiskEngine,
+    RiskLevel,
+    RiskSignal,
+    RunningRiskStore,
+)
 from webapi_captcha.scoring import (
     ScoringHeuristic,
     SignalScoreCheck,
@@ -90,6 +103,7 @@ if TYPE_CHECKING:
     from webapi_captcha.sql import (
         SQLAdaptiveDecisionStore,
         SQLCaptchaStore,
+        SQLRunningRiskStore,
         SQLTrajectoryFingerprintStore,
         SQLTrustStore,
         SQLVerificationStore,
@@ -107,6 +121,7 @@ __all__ = [
     "AdaptiveCaptchaGate",
     "AdaptiveDecision",
     "AdaptiveDecisionStore",
+    "BehaviorScoreRiskSignal",
     "CaptchaChallenge",
     "CaptchaCheck",
     "CaptchaGate",
@@ -123,6 +138,7 @@ __all__ = [
     "MathCaptchaProvider",
     "MemoryAdaptiveDecisionStore",
     "MemoryCaptchaStore",
+    "MemoryRunningRiskStore",
     "MemoryTrajectoryFingerprintStore",
     "MemoryTrustStore",
     "MemoryVerificationStore",
@@ -135,8 +151,17 @@ __all__ = [
     "ProofOfWorkProvider",
     "ReCaptchaProvider",
     "RepeatedMovementCheck",
+    "ReputationRiskSignal",
+    "RiskAssessment",
+    "RiskContext",
+    "RiskContribution",
+    "RiskEngine",
+    "RiskLevel",
+    "RiskSignal",
+    "RunningRiskStore",
     "SQLAdaptiveDecisionStore",
     "SQLCaptchaStore",
+    "SQLRunningRiskStore",
     "SQLTrajectoryFingerprintStore",
     "SQLTrustStore",
     "SQLVerificationStore",
@@ -155,6 +180,7 @@ __all__ = [
     "build_captcha_router",
     "build_captcha_widget_router",
     "build_cloudflare_style_guard",
+    "build_passive_risk_router",
     "default_behavior_heuristics",
     "fingerprint_trajectory",
     "honeypot_field_empty",
@@ -176,6 +202,7 @@ def __getattr__(name: str) -> object:
         "SQLTrajectoryFingerprintStore",
         "SQLAdaptiveDecisionStore",
         "SQLTrustStore",
+        "SQLRunningRiskStore",
     ):
         from webapi_captcha import sql
 
