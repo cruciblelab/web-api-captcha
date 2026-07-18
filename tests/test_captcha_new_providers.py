@@ -10,7 +10,11 @@ import pytest
 
 from webapi_captcha.memory import MemoryCaptchaStore
 from webapi_captcha.providers.path_trace import PathTraceProvider
-from webapi_captcha.providers.proof_of_work import ProofOfWorkProvider, _leading_zero_bits
+from webapi_captcha.providers.proof_of_work import (
+    LoadAdaptiveDifficulty,
+    ProofOfWorkProvider,
+    _leading_zero_bits,
+)
 
 # -- proof of work --
 
@@ -50,6 +54,32 @@ async def test_pow_rejects_a_nonce_that_does_not_clear_the_difficulty() -> None:
     challenge = await provider.issue()
 
     assert await provider.verify(challenge.challenge_id, "0") is False
+
+
+def test_load_adaptive_difficulty_stays_at_base_under_low_load() -> None:
+    adaptive = LoadAdaptiveDifficulty(
+        base_difficulty=16, max_difficulty=24, window_seconds=10.0, requests_per_second_at_max=20.0
+    )
+    assert adaptive() == 16
+
+
+def test_load_adaptive_difficulty_climbs_towards_max_under_burst_load() -> None:
+    adaptive = LoadAdaptiveDifficulty(
+        base_difficulty=16, max_difficulty=24, window_seconds=10.0, requests_per_second_at_max=20.0
+    )
+    difficulties = [adaptive() for _ in range(200)]
+    assert difficulties[0] == 16
+    assert difficulties[-1] == 24
+
+
+async def test_pow_provider_accepts_a_difficulty_callable() -> None:
+    store = MemoryCaptchaStore()
+    provider = ProofOfWorkProvider(store, difficulty=lambda: 8)
+    challenge = await provider.issue()
+
+    assert challenge.params["difficulty"] == 8
+    nonce = _solve_pow(challenge.params["prefix"], challenge.params["difficulty"])
+    assert await provider.verify(challenge.challenge_id, nonce) is True
 
 
 async def test_pow_solution_is_one_time_use() -> None:

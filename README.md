@@ -144,7 +144,13 @@ inheritance needed:
   Turnstile-style, the user does nothing; the browser does a small
   hashcash search in the background while the page loads. The server
   verifies with a single hash -- no image render, no third-party call,
-  minimal and constant server cost regardless of `difficulty`.
+  minimal and constant server cost regardless of `difficulty`. Pass a
+  `LoadAdaptiveDifficulty()` instance instead of a plain `int` for the
+  mCaptcha-style pattern: difficulty tracks the recent rate of issued
+  challenges and rises towards a ceiling during a traffic spike/DDoS
+  (each extra bit doubles the client's expected work), then relaxes back
+  down once it passes -- real visitors on a quiet site never notice,
+  attackers pay a rising CPU tax that scales with their own volume.
 - **Behavioral score** -- `SignalScoreCheck`: transparent, weighted
   heuristics over mouse kinematics collected client-side as the user
   approaches the widget (curvature ratio, velocity/timing variance,
@@ -170,6 +176,21 @@ inheritance needed:
   is unreachable).
 - **`PathTraceProvider`** -- draw-the-line interaction friction, no
   visible image.
+
+## Accessibility
+
+CAPTCHA is the single most-cited accessibility barrier by screen-reader
+users in WebAIM's ongoing survey -- ranked above ambiguous links, missing
+alt text, and inaccessible search combined. Every provider here that
+requires no visual/audio challenge (`ProofOfWorkProvider`,
+`SignalScoreCheck`, `RepeatedMovementCheck`, `PathTraceProvider`'s
+line-draw) is usable identically by a screen-reader user, a keyboard-only
+user, and a sighted mouse user, because there is nothing to see or hear in
+the first place -- not an accessibility mode bolted on afterwards. If you
+need a fully self-hosted, zero-visual-challenge setup, compose those three
+with `FallbackCaptchaProvider` and skip the image providers
+(`MathCaptchaProvider`/`TextCaptchaProvider`) entirely, or keep them only
+as a last-resort tier behind `AdaptiveCaptchaGate`'s escalation.
 
 ## Adaptive escalation and `PageGuard`
 

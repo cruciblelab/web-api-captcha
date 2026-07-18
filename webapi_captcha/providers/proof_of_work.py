@@ -28,6 +28,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
+from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from webapi_captcha._shared import check_pending_challenge
@@ -47,6 +50,48 @@ def _leading_zero_bits(digest: bytes) -> int:
     return bits
 
 
+class LoadAdaptiveDifficulty:
+    """Scales PoW difficulty with the rate of challenges being issued --
+    the mCaptcha pattern: a quiet site stays at `base_difficulty` (cheap,
+    near-instant for real visitors), a traffic spike/DDoS pushes difficulty
+    up towards `max_difficulty` (each extra bit doubles the client's
+    expected work), and it relaxes again once the spike passes. Server
+    cost is unaffected either way -- verification is always one hash.
+
+    Pass an instance as `ProofOfWorkProvider(..., difficulty=LoadAdaptiveDifficulty())`.
+    Call it (or let the provider call it) once per issued challenge; it
+    keeps its own sliding window, no external metrics/store needed.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_difficulty: int = 16,
+        max_difficulty: int = 24,
+        window_seconds: float = 10.0,
+        requests_per_second_at_max: float = 20.0,
+    ) -> None:
+        if max_difficulty < base_difficulty:
+            raise ValueError("max_difficulty must be >= base_difficulty")
+        self.base_difficulty = base_difficulty
+        self.max_difficulty = max_difficulty
+        self.window_seconds = window_seconds
+        self.requests_per_second_at_max = requests_per_second_at_max
+        self._issued_at: deque[float] = deque()
+
+    def __call__(self) -> int:
+        now = time.monotonic()
+        self._issued_at.append(now)
+        cutoff = now - self.window_seconds
+        while self._issued_at and self._issued_at[0] < cutoff:
+            self._issued_at.popleft()
+
+        rate = len(self._issued_at) / self.window_seconds
+        load_fraction = min(1.0, rate / self.requests_per_second_at_max)
+        span = self.max_difficulty - self.base_difficulty
+        return self.base_difficulty + round(load_fraction * span)
+
+
 class ProofOfWorkProvider:
     """`CaptchaProvider` whose "challenge" is: find a `nonce` such that
     `sha256(f"{prefix}{nonce}")` has at least `difficulty` leading zero
@@ -63,11 +108,11 @@ class ProofOfWorkProvider:
         self,
         store: CaptchaStore,
         *,
-        difficulty: int = 16,
+        difficulty: int | Callable[[], int] = 16,
         ttl: timedelta = timedelta(minutes=10),
         max_attempts: int = 50,
     ) -> None:
-        if difficulty < 1:
+        if isinstance(difficulty, int) and difficulty < 1:
             raise ValueError("difficulty must be >= 1")
         self.store = store
         self.difficulty = difficulty
@@ -81,11 +126,12 @@ class ProofOfWorkProvider:
         prefix = secrets.token_hex(8)
         challenge_id = secrets.token_urlsafe(16)
         now = datetime.now(UTC)
+        difficulty = self.difficulty() if callable(self.difficulty) else self.difficulty
         await self.store.create(
             PendingCaptcha(
                 challenge_id=challenge_id,
                 kind=self.kind,
-                answer=json.dumps({"prefix": prefix, "difficulty": self.difficulty}),
+                answer=json.dumps({"prefix": prefix, "difficulty": difficulty}),
                 created_at=now,
                 expires_at=now + self.ttl,
             )
@@ -97,7 +143,7 @@ class ProofOfWorkProvider:
             params={
                 "algorithm": "sha256-leading-zero-bits",
                 "prefix": prefix,
-                "difficulty": self.difficulty,
+                "difficulty": difficulty,
             },
             expires_at=now + self.ttl,
         )

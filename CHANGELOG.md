@@ -2,6 +2,26 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+- **`LoadAdaptiveDifficulty`** for `ProofOfWorkProvider`: pass it instead
+  of a plain `int` difficulty to get mCaptcha-style load-adaptive PoW —
+  difficulty tracks the recent rate of issued challenges and rises
+  towards a ceiling during a traffic spike/DDoS, then relaxes back down
+  once it passes. `ProofOfWorkProvider.difficulty` now accepts
+  `int | Callable[[], int]`. Motivated by researching the open-source
+  captcha/anti-bot landscape (ALTCHA, Cap.js, mCaptcha, FriendlyCaptcha,
+  hCaptcha, reCAPTCHA v3, Cloudflare Turnstile) before this release: our
+  own `ProofOfWorkProvider` had a static difficulty, unlike mCaptcha's
+  headline differentiator.
+- Documented (README, "Accessibility" section) that the no-visual-
+  challenge providers (`ProofOfWorkProvider`, `SignalScoreCheck`,
+  `RepeatedMovementCheck`, `PathTraceProvider`) give an identical
+  experience to screen-reader/keyboard-only users by construction, not as
+  a bolted-on mode — same pattern ALTCHA and Cap.js market as a core
+  differentiator, backed by WebAIM's survey data on CAPTCHA being the
+  most-cited screen-reader accessibility complaint.
+
 ## [0.1.0] — Initial release
 
 Split out of [discord-webapi](https://github.com/cruciblelab/discord-webapi)'s

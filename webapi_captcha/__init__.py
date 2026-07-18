@@ -59,7 +59,7 @@ from webapi_captcha.providers.fallback import FallbackCaptchaProvider
 from webapi_captcha.providers.hcaptcha import HCaptchaProvider
 from webapi_captcha.providers.math_captcha import MathCaptchaProvider
 from webapi_captcha.providers.path_trace import PathTraceProvider
-from webapi_captcha.providers.proof_of_work import ProofOfWorkProvider
+from webapi_captcha.providers.proof_of_work import LoadAdaptiveDifficulty, ProofOfWorkProvider
 from webapi_captcha.providers.recaptcha import ReCaptchaProvider
 from webapi_captcha.providers.text_captcha import TextCaptchaProvider
 from webapi_captcha.providers.turnstile import TurnstileProvider
@@ -131,6 +131,7 @@ __all__ = [
     "PathTraceProvider",
     "PendingCaptcha",
     "PredicateCheck",
+    "LoadAdaptiveDifficulty",
     "ProofOfWorkProvider",
     "ReCaptchaProvider",
     "RepeatedMovementCheck",
