@@ -137,6 +137,48 @@ class RiskEngine:
         }
         self.short_circuit_on_override = short_circuit_on_override
 
+    def add_signal(self, signal: RiskSignal, *, before: str | None = None) -> None:
+        """Register a new signal at runtime -- e.g. wire in a paid
+        fraud-score API only once an admin turns a feature flag on,
+        without rebuilding the whole `RiskEngine`/gate/`PageGuard` stack.
+        `signals`/`level_thresholds`/`short_circuit_on_override` are all
+        plain public attributes too -- mutate them directly (`engine.
+        signals.append(...)`, `engine.level_thresholds[RiskLevel.HIGH] =
+        0.9`, ...) whenever a method here doesn't cover what you need;
+        this class deliberately keeps no private/hidden state to work
+        around.
+
+        `before`: insert ahead of the first signal with this `name`
+        instead of appending -- matters when
+        `short_circuit_on_override=True`, since evaluation order decides
+        which cheap checks run before an expensive one gets a chance to
+        short-circuit (see the class docstring)."""
+        if before is not None:
+            for index, existing in enumerate(self.signals):
+                if existing.name == before:
+                    self.signals.insert(index, signal)
+                    return
+        self.signals.append(signal)
+
+    def remove_signal(self, name: str) -> RiskSignal | None:
+        """Removes and returns the first signal with this `name`, or
+        `None` if none matched -- the inverse of `add_signal()`, for
+        turning a signal off at runtime (e.g. a feature flag flip, a
+        third-party API you've decided to stop trusting)."""
+        for index, existing in enumerate(self.signals):
+            if existing.name == name:
+                return self.signals.pop(index)
+        return None
+
+    def get_signal(self, name: str) -> RiskSignal | None:
+        """Looks up a registered signal by name -- e.g. to read or tweak
+        its own `weight` in place (`engine.get_signal("behavior-score").
+        weight = 4.0`) without removing and re-adding it."""
+        for existing in self.signals:
+            if existing.name == name:
+                return existing
+        return None
+
     async def assess(self, ctx: RiskContext) -> RiskAssessment:
         contributions: dict[str, RiskContribution] = {}
         best_override: RiskLevel | None = None

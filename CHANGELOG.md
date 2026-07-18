@@ -24,6 +24,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   tier use a different provider -- self-hosted for the low tiers,
   reCAPTCHA/hCaptcha/Turnstile only for the tier that's actually
   suspicious enough to be worth the third-party round trip.
+  `ReputationRiskSignal`/`BehaviorScoreRiskSignal`'s `name`/`weight` are
+  constructor keyword args, not fixed class attributes -- every part of
+  the pipeline is tunable. `RiskEngine.add_signal()`/`remove_signal()`/
+  `get_signal()` let signals be wired in/out or re-tuned at runtime
+  (e.g. a feature flag turning a paid fraud-score signal on) without
+  rebuilding the gate/`PageGuard` stack; `signals`/`level_thresholds`/
+  `short_circuit_on_override` stay plain public attributes too, for
+  anything the three methods don't cover.
 - **`LoadAdaptiveDifficulty`** for `ProofOfWorkProvider`: pass it instead
   of a plain `int` difficulty to get mCaptcha-style load-adaptive PoW —
   difficulty tracks the recent rate of issued challenges and rises

@@ -160,6 +160,38 @@ async def test_risk_engine_is_suspicious_drop_in_at_the_elevated_line() -> None:
     assert await engine.is_suspicious("1.2.3.4") is False
 
 
+async def test_add_signal_appends_by_default_and_inserts_before_a_named_signal() -> None:
+    engine = RiskEngine([_FixedSignal("a", 0.0)])
+    engine.add_signal(_FixedSignal("c", 0.0))
+    assert [s.name for s in engine.signals] == ["a", "c"]
+
+    engine.add_signal(_FixedSignal("b", 0.0), before="c")
+    assert [s.name for s in engine.signals] == ["a", "b", "c"]
+
+
+async def test_remove_signal_removes_and_returns_it_or_none_if_missing() -> None:
+    target = _FixedSignal("gone", 0.0)
+    engine = RiskEngine([_FixedSignal("a", 0.0), target])
+
+    removed = engine.remove_signal("gone")
+    assert removed is target
+    assert [s.name for s in engine.signals] == ["a"]
+
+    assert engine.remove_signal("gone") is None
+
+
+async def test_get_signal_finds_by_name_and_its_weight_can_be_tuned_in_place() -> None:
+    signal = _FixedSignal("tunable", 0.9, weight=1.0)
+    engine = RiskEngine([signal])
+
+    found = engine.get_signal("tunable")
+    assert found is signal
+    found.weight = 5.0  # type: ignore[union-attr]
+    assert signal.weight == 5.0
+
+    assert engine.get_signal("missing") is None
+
+
 async def test_running_risk_store_bump_raises_but_never_lowers_the_level() -> None:
     store = MemoryRunningRiskStore()
     assert await store.get(1) is None
