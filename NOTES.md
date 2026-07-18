@@ -7,6 +7,77 @@
 > `CHANGELOG.md` neyin değiştiğini, bu dosya NEDEN öyle tasarlandığını
 > anlatıyor.
 
+## Tiered storage + v1 siteler-arası güven receipt'i (3. netleştirme turu)
+
+Kullanıcının isteği: "hatırlama" (TrustStore/RunningRiskStore) sistemi
+için performans amaçlı katmanlı önbellekleme (örneği: 6 saate kadar
+Redis, sonrası başka bir depo) ve daha önceki "bir sitede doğrulanan
+başka sitede de tanınsın" vizyonunun somut, güvenli bir ilk sürümü.
+
+**Önce dürüst bir araştırma yapıldı** (WebSearch ile doğrulanmış):
+IETF'in Privacy Pass standardı gerçek (RFC 9576/9577/9578, Haziran 2024,
+RSA Blind Signatures RFC 9474 üzerine kurulu) ama Python'da bunu
+uygulayan olgun/denetlenmiş bir kütüphane BULUNAMADI. Kendi
+blind-signature kriptografimizi bir oturumda, uzman denetimi olmadan
+yazmak "maksimum güvenlik" hedefiyle çelişirdi — bu yüzden kademeli bir
+yol izlendi: **v1'i şimdi, sadece zaten denetlenmiş primitiflerle
+(`cryptography` paketi) inşa et; gerçek anonim blind-signature'ı ("v2")
+ileride, denetlenmiş bir kütüphane çıkarsa ele al.**
+
+### 1) `TieredTrustStore`/`TieredRunningRiskStore` (`webapi_captcha/tiered.py`)
+
+Cache-aside: yaz → hem hızlı hem yavaş katmana (hızlı katmanın TTL'i
+`fast_ttl_cap`'e sıkıştırılır, kendi kendine siliniyor); oku → önce
+hızlı, miss'te yavaş katmana düş. **Kritik incelik** (Plan agent'ının
+bulup testle doğruladığı): `TieredRunningRiskStore.bump()` iki katmana
+olduğu gibi yazamaz — önce `get()` (hızlı→yavaş fallback) ile gerçek
+mevcut seviyeyi okuyup `max(current, yeni)` alması, SONRA bu birleşmiş
+değeri her iki katmana yazması gerekiyor; yoksa hızlı katmanın süresi
+dolduktan hemen sonra gelen düşük bir bump, yavaş katmandaki hâlâ geçerli
+yüksek seviyeyi sessizce geçersiz kılabilirdi. Testle (`test_tiered_
+running_risk_store_bump_merges_across_tiers_never_regresses`) doğrulandı.
+Gerçek bir Redis backend'i de eklendi (`webapi_captcha/redis_store.py`,
+yeni `redis` extra'sı arkasında, `all`'a EKLENMEDİ çünkü `all` bugün
+"canlı dış servis gerekmez" anlamına geliyor). **Test sırasında bulunan
+gerçek bug**: Redis'in `SET ... EX ...`'i negatif/sıfır TTL'i hata olarak
+reddediyor (Memory store'ların "zaten geçmişte" davranışının aksine) —
+`_expire_seconds()` yardımcı fonksiyonuyla düzeltildi (negatif/sıfır TTL
+→ anahtarı sil, SET'e hiç gitme).
+
+### 2) v1 siteler-arası güven receipt'i (`webapi_captcha/receipts.py`)
+
+**Fernet değil, Ed25519** — Fernet simetrik olduğu için güven ağındaki
+her site aynı gizli anahtarı paylaşmak zorunda kalırdı (anahtarı bilen
+herkes sahte receipt basabilirdi). Ed25519 ile issuer private key'le
+imzalar, verifier'lar sadece public key tutar — imzalayamaz, sadece
+doğrulayabilir. Bir verifier birden fazla issuer'a güvenebilir
+(`dict[issuer_id, public_key]`).
+
+- `TrustReceipt.subject_id` **ANONİM DEĞİL** — aynı subject_id iki farklı
+  sitede sunulursa eşleştirilebilir; bu gerçek Privacy Pass'in önlediği
+  şey, burada çözülmüyor, dokümantasyonda açıkça yazılı.
+- `TrustTokenVerifier.verify()` **BİLEREK FAIL-CLOSED** — paketin geri
+  kalanının fail-open felsefesinden bilinçli bir sapma: bir receipt
+  güveni doğrudan veren şey, o yüzden herhangi bir belirsizlik her zaman
+  `None` döner.
+- **Entegrasyon**: `RiskSignal` DEĞİL (RiskEngine sadece yükseltmek için
+  tasarlı, aşağı zorlama mekanizması yok) — `TrustStore` ile PARALEL,
+  ikinci bir "zaten güvenilir" kaynağı. `AdaptiveCaptchaGate.__init__`'e
+  opsiyonel `trust_token_verifier=`, `is_currently_trusted()`/
+  `get_info()`/`verify()`'a opsiyonel `trust_token=` — mantık: receipt
+  geçerli VEYA trust_store güveniyor → güvenilir (OR). `PageGuard.
+  require_human()` de aynı şekilde — **bu paket `request.headers`/
+  `cookies`'e kendisi bakmıyor**, çağıran uygulama token'ı çıkarıp elle
+  geçiriyor.
+- **Bilerek çözülmeyen**: `subject_id`'nin yerel `user_id` ile eşleştiği
+  doğrulanmıyor (çağıran uygulamanın sorumluluğu) ve token'ın site A'dan
+  site B'ye tarayıcı üzerinden nasıl taşınacağı (üçüncü-taraf çerezler
+  kaldırılıyor, bu ayrı ve çözülmemiş bir dağıtım problemi).
+
+Tamamen ek/opt-in: `TrustStore`/`RunningRiskStore` Protocol şekli
+değişmedi, `AdaptiveCaptchaGate`'in mevcut hiçbir constructor parametresi
+kırılmadı. 322 test yeşil (300 → 322), ruff/mypy temiz.
+
 ## PyPI yayını öncesi captcha-ekosistemi araştırması ve `LoadAdaptiveDifficulty`
 
 PyPI'ye yayınlamadan önce açık-kaynak captcha/anti-bot ekosistemi

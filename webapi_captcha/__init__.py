@@ -65,6 +65,7 @@ from webapi_captcha.providers.proof_of_work import LoadAdaptiveDifficulty, Proof
 from webapi_captcha.providers.recaptcha import ReCaptchaProvider
 from webapi_captcha.providers.text_captcha import TextCaptchaProvider
 from webapi_captcha.providers.turnstile import TurnstileProvider
+from webapi_captcha.receipts import TrustReceipt, TrustTokenIssuer, TrustTokenVerifier
 from webapi_captcha.replay_guard import (
     DEFAULT_GRID_MS,
     DEFAULT_GRID_PX,
@@ -103,10 +104,12 @@ from webapi_captcha.signals import (
     require_min_interaction_ms,
     require_signal_flag,
 )
+from webapi_captcha.tiered import TieredRunningRiskStore, TieredTrustStore
 from webapi_captcha.transport import Event, Transport
 from webapi_captcha.widget import DEFAULT_WIDGET_MOUNT_PATH, build_captcha_widget_router
 
 if TYPE_CHECKING:
+    from webapi_captcha.redis_store import RedisRunningRiskStore, RedisTrustStore
     from webapi_captcha.sql import (
         SQLAdaptiveDecisionStore,
         SQLCaptchaStore,
@@ -163,6 +166,8 @@ __all__ = [
     "LoadAdaptiveDifficulty",
     "ProofOfWorkProvider",
     "ReCaptchaProvider",
+    "RedisRunningRiskStore",
+    "RedisTrustStore",
     "RepeatedMovementCheck",
     "ReplayRiskSignal",
     "ReputationRiskSignal",
@@ -183,9 +188,14 @@ __all__ = [
     "SignalScoreCheck",
     "StaticBlocklistReputationChecker",
     "TextCaptchaProvider",
+    "TieredRunningRiskStore",
+    "TieredTrustStore",
     "TrajectoryFingerprintStore",
     "Transport",
+    "TrustReceipt",
     "TrustStore",
+    "TrustTokenIssuer",
+    "TrustTokenVerifier",
     "TurnstileProvider",
     "VerificationCheck",
     "VerificationContext",
@@ -222,4 +232,11 @@ def __getattr__(name: str) -> object:
         from webapi_captcha import sql
 
         return getattr(sql, name)
+    # Redis* stores need the optional `redis` extra (`webapi-captcha
+    # [redis]`) -- imported lazily so the base package never requires
+    # redis-py.
+    if name in ("RedisTrustStore", "RedisRunningRiskStore"):
+        from webapi_captcha import redis_store
+
+        return getattr(redis_store, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

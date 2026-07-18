@@ -43,6 +43,7 @@ from webapi_captcha.checks import (
 from webapi_captcha.events import EVENT_TYPE_CAPTCHA_VERIFIED, CaptchaVerified
 from webapi_captcha.gate import CheckResult
 from webapi_captcha.models import CaptchaChallenge, VerificationRequest
+from webapi_captcha.receipts import TrustTokenVerifier
 from webapi_captcha.reputation import IPReputationChecker
 from webapi_captcha.risk import RiskAssessment, RiskContext, RiskEngine, RiskLevel, RunningRiskStore
 from webapi_captcha.transport import Event, Transport
@@ -195,6 +196,7 @@ class AdaptiveCaptchaGate:
         min_level_by_purpose: dict[str, RiskLevel] | None = None,
         running_risk_store: RunningRiskStore | None = None,
         running_risk_ttl: timedelta = timedelta(minutes=30),
+        trust_token_verifier: TrustTokenVerifier | None = None,
     ) -> None:
         self.transport = transport
         self.store = store
@@ -218,6 +220,12 @@ class AdaptiveCaptchaGate:
         self.min_level_by_purpose = dict(min_level_by_purpose or {})
         self.running_risk_store = running_risk_store
         self.running_risk_ttl = running_risk_ttl
+        # Also optional/additive -- a second, alternate "already trusted"
+        # source alongside `trust_store` (see `is_currently_trusted`),
+        # for a receipt issued by another site this deployment has
+        # chosen to trust. See `webapi_captcha.receipts` for what this
+        # is and, importantly, is NOT (not anonymous, v1 only).
+        self.trust_token_verifier = trust_token_verifier
         # Per-token locks -- two concurrent calls for the SAME token (a
         # double page load, a client retry, two open tabs) used to race
         # on both `_resolve_decision` (each could see no decision stored
@@ -237,13 +245,35 @@ class AdaptiveCaptchaGate:
         # which gets a fresh lock and re-reads current state regardless.
         self._token_locks: dict[str, asyncio.Lock] = {}
 
-    async def is_currently_trusted(self, user_id: int, *, client_ip: str | None = None) -> bool:
+    async def is_currently_trusted(
+        self,
+        user_id: int,
+        *,
+        client_ip: str | None = None,
+        trust_token: str | None = None,
+    ) -> bool:
         """Whether `user_id` is trusted *right now*, without minting or
         touching any verification token -- the piece `PageGuard` needs to
         decide "does this visitor even need a fresh verification link" at
-        all, before creating one. `False` if there's no `trust_store`
-        configured. Honors `bind_trust_to_ip` the same way `_resolve_
-        decision` does."""
+        all, before creating one. Honors `bind_trust_to_ip` the same way
+        `_resolve_decision` does.
+
+        `trust_token`: an optional cross-site trust receipt (see
+        `webapi_captcha.receipts`) -- checked FIRST if both a token and
+        `trust_token_verifier` are configured, since verifying a
+        signature is cheap and doesn't need `trust_store` at all. A
+        valid receipt OR a trusted `trust_store` entry is enough (an
+        OR, not a requirement for both): they're two independent ways to
+        reach "skip verification entirely" -- `trust_store` for "this
+        exact site already saw them clear a captcha," the receipt for
+        "another site we've chosen to trust already saw them clear one."
+        This package never reads the token from a request itself -- the
+        caller extracts it from wherever it lives (a header, a cookie,
+        its own session) and passes the raw string in, same as
+        `authenticated_user_id`."""
+        if trust_token is not None and self.trust_token_verifier is not None:
+            if self.trust_token_verifier.verify(trust_token) is not None:
+                return True
         if self.trust_store is None:
             return False
         return await self.trust_store.is_trusted(
@@ -344,14 +374,16 @@ class AdaptiveCaptchaGate:
         await self.store.create(request)
         return request
 
-    async def get_info(self, token: str, *, client_ip: str | None = None) -> dict[str, Any] | None:
+    async def get_info(
+        self, token: str, *, client_ip: str | None = None, trust_token: str | None = None
+    ) -> dict[str, Any] | None:
         """Same shape as `CaptchaGate.get_info()` -- what the frontend
         needs to render the right thing, including the same "already
         verified" vs. "gone" distinction (see that docstring for why: a
         page reload after success must not look like an expired link).
         Making/persisting the escalation decision (if not already made)
         happens here, since this is the first point at which the
-        connecting IP is known."""
+        connecting IP is known. `trust_token`: see `is_currently_trusted`."""
         request = await self._get_live(token)
         if request is None:
             return None
@@ -362,7 +394,7 @@ class AdaptiveCaptchaGate:
                 "requires_account": self.require_account,
                 "verified": True,
             }
-        decision = await self._resolve_decision(token, request, client_ip)
+        decision = await self._resolve_decision(token, request, client_ip, trust_token=trust_token)
         return {
             "challenge": decision.challenge,
             "requires_captcha": decision.requires_captcha,
@@ -379,6 +411,7 @@ class AdaptiveCaptchaGate:
         signals: dict[str, Any] | None = None,
         client_ip: str | None = None,
         user_agent: str | None = None,
+        trust_token: str | None = None,
     ) -> CheckResult:
         """Same contract as `CaptchaGate.verify()`. Reuses whatever
         escalation decision `get_info()` already made for this token
@@ -412,7 +445,7 @@ class AdaptiveCaptchaGate:
                     return CheckResult(verified=True, passed=[])
 
                 decision = await self._resolve_decision_locked(
-                    token, request, client_ip, signals=signals
+                    token, request, client_ip, signals=signals, trust_token=trust_token
                 )
                 # The check that reads ctx.request.challenge (CaptchaCheck)
                 # needs it there -- AdaptiveDecision is kept in its own
@@ -496,6 +529,7 @@ class AdaptiveCaptchaGate:
         client_ip: str | None,
         *,
         signals: dict[str, Any] | None = None,
+        trust_token: str | None = None,
     ) -> AdaptiveDecision:
         """Acquires this token's lock itself -- for callers (`get_info`)
         that don't already hold it. `verify()` holds the lock for its
@@ -507,7 +541,7 @@ class AdaptiveCaptchaGate:
         try:
             async with lock:
                 return await self._resolve_decision_locked(
-                    token, request, client_ip, signals=signals
+                    token, request, client_ip, signals=signals, trust_token=trust_token
                 )
         finally:
             self._token_locks.pop(token, None)
@@ -519,12 +553,15 @@ class AdaptiveCaptchaGate:
         client_ip: str | None,
         *,
         signals: dict[str, Any] | None = None,
+        trust_token: str | None = None,
     ) -> AdaptiveDecision:
         existing = await self.decision_store.get(token)
         if existing is not None:
             return existing
 
-        trusted = await self.is_currently_trusted(request.user_id, client_ip=client_ip)
+        trusted = await self.is_currently_trusted(
+            request.user_id, client_ip=client_ip, trust_token=trust_token
+        )
 
         requires_captcha = False
         challenge = None

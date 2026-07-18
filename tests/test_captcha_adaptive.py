@@ -5,6 +5,8 @@ gate. Same overall shape as test_captcha_gate.py's coverage of
 import asyncio
 from datetime import timedelta
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from webapi_captcha.adaptive import (
     AdaptiveCaptchaGate,
     MemoryAdaptiveDecisionStore,
@@ -14,6 +16,7 @@ from webapi_captcha.checks import PredicateCheck, VerificationContext
 from webapi_captcha.memory import MemoryCaptchaStore, MemoryVerificationStore
 from webapi_captcha.providers.math_captcha import MathCaptchaProvider
 from webapi_captcha.providers.path_trace import PathTraceProvider
+from webapi_captcha.receipts import TrustTokenIssuer, TrustTokenVerifier
 from webapi_captcha.reputation import StaticBlocklistReputationChecker
 from webapi_captcha.risk import (
     MemoryRunningRiskStore,
@@ -413,3 +416,53 @@ async def test_running_risk_store_floor_escalates_a_fresh_tokens_decision() -> N
 
     assert info is not None
     assert info["requires_captcha"] is True
+
+
+def _make_verifier() -> tuple[TrustTokenIssuer, TrustTokenVerifier]:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    return issuer, verifier
+
+
+async def test_is_currently_trusted_true_via_valid_trust_token_with_no_trust_store() -> None:
+    issuer, verifier = _make_verifier()
+    gate = _make_gate(trust_store=None, trust_token_verifier=verifier)
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1))
+
+    assert await gate.is_currently_trusted(100, trust_token=token) is True
+
+
+async def test_is_currently_trusted_false_via_invalid_token_falls_back_to_trust_store() -> None:
+    _, verifier = _make_verifier()
+    trust_store = MemoryTrustStore()
+    await trust_store.trust(100, ttl=timedelta(hours=1))
+    gate = _make_gate(trust_store=trust_store, trust_token_verifier=verifier)
+
+    assert await gate.is_currently_trusted(100, trust_token="garbage") is True
+
+
+async def test_is_currently_trusted_false_when_neither_source_says_trusted() -> None:
+    _, verifier = _make_verifier()
+    gate = _make_gate(trust_store=MemoryTrustStore(), trust_token_verifier=verifier)
+
+    assert await gate.is_currently_trusted(100, trust_token="garbage") is False
+
+
+async def test_get_info_and_verify_accept_trust_token_and_skip_escalation() -> None:
+    """End to end: a suspicious IP that would normally escalate, but a
+    valid trust_token bypasses the escalation decision entirely."""
+    issuer, verifier = _make_verifier()
+    gate = _make_gate(trust_store=None, trust_token_verifier=verifier)
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1))
+
+    request = await gate.create_verification(user_id=100, purpose="signup")
+    info = await gate.get_info(request.token, client_ip="1.2.3.4", trust_token=token)
+
+    assert info is not None
+    assert info["requires_captcha"] is False
+
+    result = await gate.verify(
+        request.token, client_ip="1.2.3.4", signals={}, trust_token=token
+    )
+    assert result.verified is True

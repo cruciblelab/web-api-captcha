@@ -4,6 +4,45 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **`TieredTrustStore`/`TieredRunningRiskStore`** (`webapi_captcha.tiered`,
+  new module): fast/slow cache-aside composition for any two
+  `TrustStore`/`RunningRiskStore` implementations -- writes go to both
+  tiers (fast tier's own TTL capped at `fast_ttl_cap`, so it evicts
+  itself with no manual age bookkeeping), reads check the fast tier
+  first and fall back to the slow tier on a miss. `TieredRunningRiskStore
+  .bump()` reads the true current level across both tiers before writing
+  (not a verbatim write to each), since `RunningRiskStore`'s "never
+  regresses" contract would otherwise break if the fast tier's entry
+  expired while the slow tier's hadn't. New **`webapi_captcha.redis_store`**
+  (`RedisTrustStore`/`RedisRunningRiskStore`, behind a new `redis` extra,
+  not part of `all` since `all` today implies no live external service)
+  gives a concrete fast-tier implementation using Redis's native key
+  expiry.
+- **`webapi_captcha.receipts`** (new module): a v1, deliberately
+  NON-anonymous cross-site trust receipt -- solve a captcha on one site,
+  be recognized as already-verified on another site you've chosen to
+  trust. `TrustTokenIssuer`/`TrustTokenVerifier` use Ed25519 asymmetric
+  signing (already available via `cryptography`, no new dependency,
+  chosen over Fernet because the trust model is one issuer/many
+  verifiers, not a shared secret every relying site would need to hold).
+  Deliberately NOT the anonymous IETF Privacy Pass / RSA Blind Signatures
+  scheme (RFC 9576-9578/9474) -- no mature, audited Python implementation
+  of that exists today, and this package won't roll its own
+  blind-signature cryptography without one; `TrustReceipt.subject_id` is
+  opaque but linkable, not anonymous, and this is documented prominently.
+  `TrustTokenVerifier.verify()` fails **closed** on any ambiguity (bad
+  signature, unknown issuer, expired, malformed input) -- the one
+  deliberate exception to this package's usual fail-open philosophy,
+  since a receipt grants trust outright rather than contributing a soft
+  signal. Integrates as a second, alternate "already trusted" source
+  alongside `TrustStore` (OR semantics, not a `RiskSignal` -- the engine
+  can only escalate, never force a level down) via new optional
+  `trust_token_verifier`/`trust_token` parameters on
+  `AdaptiveCaptchaGate`/`PageGuard.require_human` -- this package never
+  reads the token from a request itself; the caller extracts it from
+  wherever it lives and passes the raw string in. How the token actually
+  travels from one site's browser session to another's is explicitly out
+  of scope.
 - **`RiskEngine`** (`webapi_captcha.risk`, new module): a multi-signal,
   tiered replacement for `AdaptiveCaptchaGate`/`PageGuard`'s previous
   single binary "IP suspicious or not" decision, entirely additive

@@ -328,6 +328,68 @@ can't be shared. `SQLCaptchaStore` optionally encrypts stored data at
 rest with Fernet (`MultiFernet` key-rotation supported) and exposes
 `purge_expired()` for a periodic cleanup job.
 
+**Fast/slow tiering** -- `TrustStore`/`RunningRiskStore` also compose
+into `TieredTrustStore`/`TieredRunningRiskStore` (`webapi_captcha.tiered`,
+no extra required): a fast tier (e.g. `RedisTrustStore`/
+`RedisRunningRiskStore`, behind the `redis` extra) in front of a slower,
+durable one (SQL), so the vast majority of lookups (recent visitors) stay
+cheap without giving up long-term retention.
+
+```python
+from webapi_captcha import RedisTrustStore, SQLTrustStore, TieredTrustStore
+from datetime import timedelta
+
+trust_store = TieredTrustStore(
+    fast=RedisTrustStore(redis_client),
+    slow=SQLTrustStore(engine),
+    fast_ttl_cap=timedelta(hours=6),  # recent entries live in Redis for up to 6h,
+)                                     # older ones fall back to SQL automatically
+```
+
+Writes go to both tiers (the fast tier's own TTL capped at
+`fast_ttl_cap`, so it evicts itself with no manual bookkeeping); reads
+check the fast tier first, falling back to the slow tier on a miss.
+`redis` is not part of the `all` extra -- unlike SQLite, it's a real
+service you have to run, so it stays an explicit opt-in.
+
+## Cross-site trust receipts (v1, non-anonymous)
+
+A visitor who already cleared a captcha on one site can be recognized as
+already-verified on another site you've chosen to trust -- without
+re-solving. `webapi_captcha.receipts` issues and verifies Ed25519-signed
+`TrustReceipt`s: one issuer signs, any number of independent verifiers
+hold only that issuer's public key and can verify without ever being
+able to forge new ones.
+
+```python
+from webapi_captcha import AdaptiveCaptchaGate, TrustTokenIssuer, TrustTokenVerifier
+
+# Site A (issuer), after a successful verification:
+issuer = TrustTokenIssuer(private_key, issuer_id="site-a")
+token = issuer.issue(subject_id, ttl=timedelta(hours=24))
+# hand `token` back to the visitor's own browser/session -- how it
+# travels from site A to site B is up to your application (a redirect
+# handoff, a same-site-set arrangement, ...); this package does not
+# solve cross-site transport.
+
+# Site B (verifier), configured to trust site A:
+verifier = TrustTokenVerifier({"site-a": site_a_public_key})
+gate = AdaptiveCaptchaGate(..., trust_token_verifier=verifier)
+# Wherever your route extracts the token from (a header, a cookie, ...):
+await guard.require_human(request, trust_token=extracted_token)
+```
+
+**Read before using this.** `TrustReceipt.subject_id` is opaque but NOT
+anonymous -- two sites that both see the same `subject_id` can correlate
+that it's the same visitor. This is deliberately NOT the IETF Privacy
+Pass / RSA Blind Signatures scheme (RFC 9576-9578/9474) -- no mature,
+audited Python implementation of that exists today, and this package
+won't roll its own blind-signature cryptography without one. `verify()`
+also fails **closed** (any invalid/expired/unknown-issuer/malformed token
+returns `None`), the one deliberate exception to this package's usual
+fail-open philosophy, since a receipt grants trust outright rather than
+contributing a soft signal.
+
 ## Using this with discord-webapi
 
 If you're also using [discord-webapi](https://github.com/cruciblelab/discord-webapi),

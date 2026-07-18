@@ -287,3 +287,32 @@ def test_passive_signal_endpoint_404s_without_risk_engine_or_running_risk_store(
     router = build_passive_risk_router(guard)
 
     assert router.routes == []
+
+
+def test_require_human_accepts_trust_token_and_bypasses_escalation_for_a_blocked_ip() -> None:
+    """`PageGuard` never reads the token from the request itself -- the
+    route extracts it (here, from a header) and passes it in
+    explicitly."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from webapi_captcha.receipts import TrustTokenIssuer, TrustTokenVerifier
+
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1))
+
+    app, guard, _gate = _build_app(gate_kwargs={"trust_token_verifier": verifier})
+
+    @app.get("/protected-with-token")
+    async def protected_with_token(request: Request) -> HTMLResponse:
+        await guard.require_human(request, trust_token=request.headers.get("x-trust-token"))
+        return HTMLResponse("protected content")
+
+    client = TestClient(app, client=("9.9.9.9", 12345))  # blocked IP
+
+    resp = client.get(
+        "/protected-with-token", headers={"x-trust-token": token}, follow_redirects=False
+    )
+
+    assert resp.status_code == 200

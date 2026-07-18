@@ -40,12 +40,18 @@ sql = ["webapi-captcha[sql-sqlite,sql-postgres,sql-mysql]"]
 # (ReCaptchaProvider/HCaptchaProvider/TurnstileProvider) need only httpx,
 # already a core dependency -- no extra required for those.
 render = ["Pillow>=10.1"]
+# TieredTrustStore/TieredRunningRiskStore's fast tier (webapi_captcha.
+# redis_store) -- a real, live Redis service, unlike the embedded SQLite
+# option under `sql`, so it's kept out of `all` on purpose (see
+# redis_store.py's module docstring).
+redis = ["redis>=5.0"]
 all = ["webapi-captcha[sql,render]"]
 dev = [
-  "webapi-captcha[all]",
+  "webapi-captcha[all,redis]",
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
   "respx>=0.21",
+  "fakeredis>=2.20",
   "ruff>=0.6",
   "mypy>=1.11",
 ]
