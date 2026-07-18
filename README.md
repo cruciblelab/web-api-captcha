@@ -352,6 +352,37 @@ check the fast tier first, falling back to the slow tier on a miss.
 `redis` is not part of the `all` extra -- unlike SQLite, it's a real
 service you have to run, so it stays an explicit opt-in.
 
+**The slow tier is the source of truth; the fast tier is disposable.**
+Writes go to `slow` first (a failure there always propagates -- that's
+real data at risk), then `fast` (a failure there is swallowed -- a
+crashed/unreachable cache degrades performance, never correctness).
+Reads that fail against the fast tier fall back to the slow tier the
+same way. Pass `on_fast_tier_error=` to observe swallowed fast-tier
+failures (logging, metrics) without them affecting behavior.
+
+## Trust isn't necessarily an unconditional bypass
+
+`AdaptiveCaptchaGate`'s optional `trusted_revalidation` keeps one cheap
+`RiskSignal` running even on an otherwise-trusted visitor (from either
+`trust_store` or a trust receipt) -- so a compromised/stolen trust
+cookie or receipt doesn't grant indefinite immunity:
+
+```python
+gate = AdaptiveCaptchaGate(
+    ..., trust_store=trust_store,
+    trusted_revalidation=ReputationRiskSignal(my_reputation_source),
+    trusted_revalidation_threshold=0.5,  # default
+)
+```
+
+If it flags (a `hard_override`, or `suspicion >=
+trusted_revalidation_threshold`), `is_currently_trusted()` returns
+`False` for that call -- the normal risk-assessment flow runs instead of
+being skipped. Fails open like every other soft heuristic here (an
+exception in the revalidation check does not revoke trust) --
+`trusted_revalidation=None` (the default) preserves today's "trusted is
+an unconditional skip" behavior exactly.
+
 ## Cross-site trust receipts (v1, non-anonymous)
 
 A visitor who already cleared a captcha on one site can be recognized as

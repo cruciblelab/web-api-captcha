@@ -43,6 +43,20 @@ class _OverrideSignal:
         return RiskContribution(suspicion=1.0, hard_override=self.level)
 
 
+class _FixedRevalidationSignal:
+    """A RiskSignal with a fixed graded suspicion and no hard_override --
+    used to test trusted_revalidation_threshold's boundary."""
+
+    name = "fixed"
+    weight = 1.0
+
+    def __init__(self, suspicion: float) -> None:
+        self.suspicion = suspicion
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        return RiskContribution(suspicion=self.suspicion)
+
+
 def _make_gate(**kwargs: object) -> AdaptiveCaptchaGate:
     return AdaptiveCaptchaGate(
         InProcessTransport(),
@@ -466,3 +480,73 @@ async def test_get_info_and_verify_accept_trust_token_and_skip_escalation() -> N
         request.token, client_ip="1.2.3.4", signals={}, trust_token=token
     )
     assert result.verified is True
+
+
+# -- trusted_revalidation: "trusted" is not necessarily an unconditional bypass --
+
+
+class _RaisingSignal:
+    name = "boom"
+    weight = 1.0
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        raise RuntimeError("flaky revalidation check")
+
+
+async def test_trusted_revalidation_revokes_trust_when_it_flags() -> None:
+    trust_store = MemoryTrustStore()
+    await trust_store.trust(100, ttl=timedelta(hours=1))
+    gate = _make_gate(
+        trust_store=trust_store,
+        trusted_revalidation=_OverrideSignal(RiskLevel.HIGH),
+    )
+
+    assert await gate.is_currently_trusted(100, client_ip="1.2.3.4") is False
+
+
+async def test_trusted_revalidation_keeps_trust_when_it_does_not_flag() -> None:
+    trust_store = MemoryTrustStore()
+    await trust_store.trust(100, ttl=timedelta(hours=1))
+    gate = _make_gate(
+        trust_store=trust_store,
+        trusted_revalidation=_FixedRevalidationSignal(0.0),
+    )
+
+    assert await gate.is_currently_trusted(100, client_ip="1.2.3.4") is True
+
+
+async def test_trusted_revalidation_only_runs_when_otherwise_trusted() -> None:
+    """No trust_store/trust_token match at all -- trusted_revalidation
+    must not run (and can't spuriously grant trust on its own)."""
+    gate = _make_gate(
+        trust_store=MemoryTrustStore(),  # nobody trusted yet
+        trusted_revalidation=_OverrideSignal(RiskLevel.HIGH),
+    )
+
+    assert await gate.is_currently_trusted(100, client_ip="1.2.3.4") is False
+
+
+async def test_trusted_revalidation_exception_fails_open_keeps_trust() -> None:
+    trust_store = MemoryTrustStore()
+    await trust_store.trust(100, ttl=timedelta(hours=1))
+    gate = _make_gate(trust_store=trust_store, trusted_revalidation=_RaisingSignal())
+
+    assert await gate.is_currently_trusted(100, client_ip="1.2.3.4") is True
+
+
+async def test_trusted_revalidation_threshold_is_configurable() -> None:
+    trust_store = MemoryTrustStore()
+    await trust_store.trust(100, ttl=timedelta(hours=1))
+    gate = _make_gate(
+        trust_store=trust_store,
+        trusted_revalidation=_FixedRevalidationSignal(0.4),
+        trusted_revalidation_threshold=0.5,
+    )
+    assert await gate.is_currently_trusted(100, client_ip="1.2.3.4") is True  # below threshold
+
+    gate2 = _make_gate(
+        trust_store=trust_store,
+        trusted_revalidation=_FixedRevalidationSignal(0.6),
+        trusted_revalidation_threshold=0.5,
+    )
+    assert await gate2.is_currently_trusted(100, client_ip="1.2.3.4") is False  # at/above

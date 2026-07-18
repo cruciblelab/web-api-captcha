@@ -7,6 +7,45 @@
 > `CHANGELOG.md` neyin değiştiğini, bu dosya NEDEN öyle tasarlandığını
 > anlatıyor.
 
+## Dayanıklılık düzeltmesi + "güvenilir" artık koşulsuz bypass değil (4. netleştirme turu)
+
+Kullanıcının iki somut isteği: (1) kesinti/çökmede veri kaybı/yazma
+sorunu olmamalı, ("direkt silmek mantıklı" onayı + konfigürasyon
+isteği), (2) ziyaretçi "güvenilir" olsa bile (trust_store ya da receipt
+üzerinden) config ile ek bir kontrolü (ör. IP itibarı) hâlâ çalıştırıp,
+o kontrol bir şey yakalarsa güveni geçersiz kılabilme. "İyice düşün, ölç
+tart, araştırma yap, karar ver" dendiği için gerçek bir deneyle
+doğrulayıp karar verdim.
+
+**Gerçek bug, deneyle bulundu**: `TieredTrustStore`/`TieredRunningRiskStore`
+`asyncio.gather()` ile iki katmana PARALEL yazıyordu. Python REPL'de
+gerçek bir deneyle doğruladım: `gather()` iki coroutine'den biri patlarsa
+HEMEN o exception'ı fırlatıyor, ama diğer coroutine arka planda çalışmaya
+devam ediyor — eğer o da patlarsa, bu İKİNCİ (ve genelde daha önemli)
+hata **sessizce yutuluyor**, çağıran taraf hiç haberdar olmuyor. Yani
+yavaş/kalıcı katman (SQL) da aynı anda başarısız olsaydı, bunu asla
+öğrenemezdik. **Düzeltme**: artık sırayla yazıyor — önce YAVAŞ/kalıcı
+katman (gerçek veri kaynağı, hata fırlatırsa HER ZAMAN yukarı taşınır),
+sonra hızlı katman (Redis gibi — sadece cache, hata fırlatırsa YUTULUR,
+işlemi çökertmez). Okuma tarafında da aynı mantık: hızlı katman
+patlarsa (Redis kesintisi), yavaş katmana düş — kesinti performansı
+düşürsün, doğruluğu bozmasın. Yeni `on_fast_tier_error` callback'i bu
+yutulan hataları gözlemlemek için (loglama/metrik).
+
+**"Güvenilir" artık koşulsuz değil**: `AdaptiveCaptchaGate`'e yeni
+opsiyonel `trusted_revalidation: RiskSignal | None` +
+`trusted_revalidation_threshold: float = 0.5`. `is_currently_trusted()`
+artık: trust_store/receipt'ten biri "güvenilir" dese bile, bu sinyal
+konfigüreliyse hâlâ çalıştırılıyor; `hard_override` ya da eşiği aşan
+`suspicion` varsa, o çağrı için güven GEÇERSİZ sayılıyor (normal risk
+akışına düşülüyor). Paketin geri kalanının fail-open felsefesiyle tutarlı
+— bu kontrolde bir exception olursa güven İPTAL EDİLMİYOR (receipt
+`verify()`'ın fail-closed olmasından FARKLI, çünkü bu ek bir kontrol,
+güveni VEREN şey değil). `trusted_revalidation=None` (varsayılan)
+bugünkü "güvenilirse tamamen atla" davranışını birebir koruyor.
+
+Tamamen ek/opt-in, 333 test yeşil (322 → 333), ruff/mypy temiz.
+
 ## Tiered storage + v1 siteler-arası güven receipt'i (3. netleştirme turu)
 
 Kullanıcının isteği: "hatırlama" (TrustStore/RunningRiskStore) sistemi

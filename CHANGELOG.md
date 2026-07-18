@@ -17,7 +17,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   (`RedisTrustStore`/`RedisRunningRiskStore`, behind a new `redis` extra,
   not part of `all` since `all` today implies no live external service)
   gives a concrete fast-tier implementation using Redis's native key
-  expiry.
+  expiry. Writes now go to `slow` FIRST, synchronously, then `fast`
+  (not both concurrently via `asyncio.gather()`, an earlier design that
+  had a confirmed gap: if `fast` failed, `gather()` propagated
+  immediately while `slow`'s coroutine kept running unawaited in the
+  background -- if `slow` *also* failed, that second, more important
+  failure was silently discarded with no trace). Failures against the
+  fast tier (read or write) never propagate and never block the slow
+  tier -- the slow tier is the source of truth, the fast tier is
+  disposable; a new `on_fast_tier_error` callback observes swallowed
+  fast-tier failures without them affecting behavior.
+- **`AdaptiveCaptchaGate.trusted_revalidation`**: an optional `RiskSignal`
+  that keeps running even on an otherwise-trusted visitor (from either
+  `trust_store` or a trust receipt) -- if it flags, `is_currently_
+  trusted()` returns `False` for that call instead of an unconditional
+  skip, so a compromised/stolen trust cookie or receipt doesn't grant
+  indefinite immunity. Fails open like every other soft heuristic here;
+  `trusted_revalidation=None` (the default) is unchanged behavior.
 - **`webapi_captcha.receipts`** (new module): a v1, deliberately
   NON-anonymous cross-site trust receipt -- solve a captcha on one site,
   be recognized as already-verified on another site you've chosen to

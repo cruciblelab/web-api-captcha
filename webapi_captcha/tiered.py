@@ -7,6 +7,32 @@ naturally evicts itself and needs no manual "is this record old enough
 to demote" bookkeeping); reads check the fast tier first, falling back
 to the slow tier on a miss.
 
+**The slow tier is the source of truth; the fast tier is disposable.**
+This governs every failure-handling decision below: a `slow` write
+failing (or raising) always propagates -- that's real data at risk, and
+silently swallowing it would mean a caller believes something was
+remembered when it wasn't. A `fast` operation failing (a Redis outage,
+a connection drop, a crash mid-write) NEVER propagates and never blocks
+the `slow` write -- losing the cache is, at worst, a slower read next
+time (it falls through to `slow`), never a correctness problem. Writes
+go to `slow` FIRST, synchronously, then `fast` -- not both concurrently
+via `asyncio.gather()` (an earlier version of this module did that, and
+it has a real, tested-and-confirmed gap: if `fast` fails, `gather()`
+propagates immediately, but `slow`'s coroutine keeps running unawaited
+in the background -- if `slow` *also* fails, that second, more important
+failure is silently retrieved-and-discarded by `gather()` with no trace,
+and the caller never learns their durable write may not have happened).
+Sequential slow-then-fast has no such gap: by the time `fast` is even
+attempted, `slow`'s outcome is already known.
+
+Fast-tier READ failures are handled the same way: if `fast.is_trusted()`
+`/get()` raises (e.g. Redis is down), that's caught and treated as a
+miss, falling through to `slow` -- an outage in the fast tier should
+degrade performance, not correctness or availability.
+
+Pass `on_fast_tier_error` to observe these swallowed failures (logging,
+metrics, alerting) without them affecting behavior.
+
 Generic over the `TrustStore`/`RunningRiskStore` Protocols (`webapi_
 captcha.adaptive`/`webapi_captcha.risk`) -- `fast`/`slow` can be any
 combination of `Memory*`/`SQL*`/your own store/the `Redis*` stores in
@@ -15,7 +41,7 @@ composes existing Store implementations."""
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 
 from webapi_captcha.adaptive import TrustStore
@@ -24,29 +50,45 @@ from webapi_captcha.risk import RiskLevel, RunningRiskStore
 DEFAULT_FAST_TTL_CAP = timedelta(hours=6)
 
 
+def _report(on_fast_tier_error: Callable[[Exception], None] | None, exc: Exception) -> None:
+    if on_fast_tier_error is not None:
+        on_fast_tier_error(exc)
+
+
 class TieredTrustStore:
     """`TrustStore` over a fast/slow pair. `trust()` has no monotonicity
-    contract (it unconditionally sets a new trusted-until), so a plain
-    write to both tiers is correct -- no read-before-write needed here,
-    unlike `TieredRunningRiskStore.bump()` below."""
+    contract (it unconditionally sets a new trusted-until), so there's no
+    read-before-write needed here, unlike `TieredRunningRiskStore.bump()`
+    below -- just a plain write to each tier, slow first. See the module
+    docstring for why slow-first/fast-never-propagates is the rule."""
 
     def __init__(
-        self, fast: TrustStore, slow: TrustStore, *, fast_ttl_cap: timedelta = DEFAULT_FAST_TTL_CAP
+        self,
+        fast: TrustStore,
+        slow: TrustStore,
+        *,
+        fast_ttl_cap: timedelta = DEFAULT_FAST_TTL_CAP,
+        on_fast_tier_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.fast = fast
         self.slow = slow
         self.fast_ttl_cap = fast_ttl_cap
+        self.on_fast_tier_error = on_fast_tier_error
 
     async def is_trusted(self, user_id: int, *, ip: str | None = None) -> bool:
-        if await self.fast.is_trusted(user_id, ip=ip):
-            return True
+        try:
+            if await self.fast.is_trusted(user_id, ip=ip):
+                return True
+        except Exception as exc:  # noqa: BLE001 -- fast tier is disposable, see module docstring
+            _report(self.on_fast_tier_error, exc)
         return await self.slow.is_trusted(user_id, ip=ip)
 
     async def trust(self, user_id: int, *, ttl: timedelta, ip: str | None = None) -> None:
-        await asyncio.gather(
-            self.fast.trust(user_id, ttl=min(ttl, self.fast_ttl_cap), ip=ip),
-            self.slow.trust(user_id, ttl=ttl, ip=ip),
-        )
+        await self.slow.trust(user_id, ttl=ttl, ip=ip)  # source of truth -- let errors propagate
+        try:
+            await self.fast.trust(user_id, ttl=min(ttl, self.fast_ttl_cap), ip=ip)
+        except Exception as exc:  # noqa: BLE001 -- fast tier is disposable, see module docstring
+            _report(self.on_fast_tier_error, exc)
 
 
 class TieredRunningRiskStore:
@@ -61,9 +103,9 @@ class TieredRunningRiskStore:
     regressing below what the slow tier still correctly remembers. So
     `bump()` reads the TRUE current level across both tiers first (via
     `get()`, which already does fast-then-slow fallback), takes
-    `max(current, level)`, and writes THAT merged result to both tiers --
-    mirroring exactly what the single-store implementations already do
-    internally, just composed across two backing stores."""
+    `max(current, level)`, and writes THAT merged result to both tiers,
+    slow first -- see the module docstring for why slow-first/fast-
+    never-propagates is the rule for failure handling too."""
 
     def __init__(
         self,
@@ -71,22 +113,29 @@ class TieredRunningRiskStore:
         slow: RunningRiskStore,
         *,
         fast_ttl_cap: timedelta = DEFAULT_FAST_TTL_CAP,
+        on_fast_tier_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.fast = fast
         self.slow = slow
         self.fast_ttl_cap = fast_ttl_cap
+        self.on_fast_tier_error = on_fast_tier_error
 
     async def get(self, user_id: int) -> RiskLevel | None:
-        level = await self.fast.get(user_id)
-        if level is not None:
-            return level
+        try:
+            level = await self.fast.get(user_id)
+            if level is not None:
+                return level
+        except Exception as exc:  # noqa: BLE001 -- fast tier is disposable, see module docstring
+            _report(self.on_fast_tier_error, exc)
         return await self.slow.get(user_id)
 
     async def bump(self, user_id: int, level: RiskLevel, *, ttl: timedelta) -> RiskLevel:
         current = await self.get(user_id)
         new_level = level if current is None else max(current, level)
-        await asyncio.gather(
-            self.fast.bump(user_id, new_level, ttl=min(ttl, self.fast_ttl_cap)),
-            self.slow.bump(user_id, new_level, ttl=ttl),
-        )
+        # Source of truth first -- let errors propagate.
+        await self.slow.bump(user_id, new_level, ttl=ttl)
+        try:
+            await self.fast.bump(user_id, new_level, ttl=min(ttl, self.fast_ttl_cap))
+        except Exception as exc:  # noqa: BLE001 -- fast tier is disposable, see module docstring
+            _report(self.on_fast_tier_error, exc)
         return new_level

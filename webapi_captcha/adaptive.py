@@ -45,7 +45,14 @@ from webapi_captcha.gate import CheckResult
 from webapi_captcha.models import CaptchaChallenge, VerificationRequest
 from webapi_captcha.receipts import TrustTokenVerifier
 from webapi_captcha.reputation import IPReputationChecker
-from webapi_captcha.risk import RiskAssessment, RiskContext, RiskEngine, RiskLevel, RunningRiskStore
+from webapi_captcha.risk import (
+    RiskAssessment,
+    RiskContext,
+    RiskEngine,
+    RiskLevel,
+    RiskSignal,
+    RunningRiskStore,
+)
 from webapi_captcha.transport import Event, Transport
 
 
@@ -197,6 +204,8 @@ class AdaptiveCaptchaGate:
         running_risk_store: RunningRiskStore | None = None,
         running_risk_ttl: timedelta = timedelta(minutes=30),
         trust_token_verifier: TrustTokenVerifier | None = None,
+        trusted_revalidation: RiskSignal | None = None,
+        trusted_revalidation_threshold: float = 0.5,
     ) -> None:
         self.transport = transport
         self.store = store
@@ -226,6 +235,13 @@ class AdaptiveCaptchaGate:
         # chosen to trust. See `webapi_captcha.receipts` for what this
         # is and, importantly, is NOT (not anonymous, v1 only).
         self.trust_token_verifier = trust_token_verifier
+        # "Trusted" isn't necessarily an unconditional, forever bypass --
+        # optionally keep running one cheap check (e.g. IP reputation)
+        # even on an otherwise-trusted visitor, so a compromised/stolen
+        # trust cookie or receipt doesn't grant indefinite immunity. See
+        # `is_currently_trusted`.
+        self.trusted_revalidation = trusted_revalidation
+        self.trusted_revalidation_threshold = trusted_revalidation_threshold
         # Per-token locks -- two concurrent calls for the SAME token (a
         # double page load, a client retry, two open tabs) used to race
         # on both `_resolve_decision` (each could see no decision stored
@@ -270,15 +286,43 @@ class AdaptiveCaptchaGate:
         This package never reads the token from a request itself -- the
         caller extracts it from wherever it lives (a header, a cookie,
         its own session) and passes the raw string in, same as
-        `authenticated_user_id`."""
+        `authenticated_user_id`.
+
+        `trusted_revalidation`: if configured, "trusted" is not an
+        unconditional bypass -- once EITHER source above says trusted,
+        this `RiskSignal` still runs (e.g. a plain `ReputationRiskSignal`
+        wrapping an IP blocklist) before the final answer is given. If it
+        flags (a `hard_override`, or `suspicion >=
+        trusted_revalidation_threshold`), trust is NOT honored for this
+        call -- the normal risk-assessment flow runs instead, so a
+        compromised/stolen trust cookie or receipt doesn't grant
+        indefinite immunity. Fails OPEN like every other soft heuristic
+        in this package (an exception here does not revoke trust) --
+        unlike `TrustTokenVerifier.verify()`, this is an extra layer of
+        scrutiny ON TOP of an already-granted trust, not the thing
+        granting it."""
+        trusted = False
         if trust_token is not None and self.trust_token_verifier is not None:
             if self.trust_token_verifier.verify(trust_token) is not None:
-                return True
-        if self.trust_store is None:
-            return False
-        return await self.trust_store.is_trusted(
-            user_id, ip=client_ip if self.bind_trust_to_ip else None
+                trusted = True
+        if not trusted and self.trust_store is not None:
+            trusted = await self.trust_store.is_trusted(
+                user_id, ip=client_ip if self.bind_trust_to_ip else None
+            )
+        if not trusted or self.trusted_revalidation is None:
+            return trusted
+
+        try:
+            contribution = await self.trusted_revalidation.assess(
+                RiskContext(client_ip=client_ip, user_id=user_id)
+            )
+        except Exception:  # noqa: BLE001 -- fail open, see docstring above
+            return True
+        flagged = contribution.hard_override is not None or (
+            contribution.suspicion is not None
+            and contribution.suspicion >= self.trusted_revalidation_threshold
         )
+        return not flagged
 
     async def assess_risk(
         self,
