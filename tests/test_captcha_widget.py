@@ -44,3 +44,20 @@ def test_widget_script_talks_to_the_gate_endpoints() -> None:
 
     assert "/api/captcha/gate/" in text
     assert "/verify" in text
+
+
+def test_widget_script_never_string_concatenates_the_challenge_image_into_html() -> None:
+    """Regression guard for a fixed XSS-shaped bug: `image_data_uri`
+    (safe for the bundled providers, but attacker-influenceable for a
+    custom `CaptchaProvider`) must be assigned via the DOM `.src`
+    property, never concatenated into an `innerHTML` string -- the
+    latter would let a crafted value (e.g. `x" onerror="...`) execute as
+    real markup/script."""
+    app = FastAPI()
+    app.include_router(build_captcha_widget_router())
+    client = TestClient(app)
+
+    text = client.get(DEFAULT_WIDGET_MOUNT_PATH).text
+
+    assert 'img.src = challenge.image_data_uri' in text
+    assert '<img src="' not in text

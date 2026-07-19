@@ -4,6 +4,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **Fixed**: the bundled widget's `renderImageChallenge()`
+  (`webapi_captcha/widget.js`) string-concatenated
+  `challenge.image_data_uri` straight into an `innerHTML` string. Safe
+  today for the bundled providers (always a server-generated base64
+  data URI), but a latent XSS path for anyone's own `CaptchaProvider`
+  putting attacker-influenceable content in that field -- `innerHTML`
+  would parse a crafted value (`x" onerror="..."`) as real markup. The
+  image is now built via `document.createElement('img')` + assigning to
+  the `.src` **property**, which never parses its value as markup.
+  Purely a hardening fix -- identical rendered output for every existing
+  provider.
 - **`TrustTokenVerifier.verify()` accepts optional `expected_subject_id`/
   `required_purpose` binding checks.** Closes a gap flagged in a security
   self-review: by default a valid trust receipt from a trusted issuer was

@@ -250,10 +250,24 @@
     this.needsExplicitAnswer = true;
     this.labelEl.textContent = 'Solve the question below';
     this.showExpand(
-      '<img src="' + challenge.image_data_uri + '" alt="captcha" />' +
+      '<div class="wac-cw-image-slot"></div>' +
       '<input type="text" class="wac-cw-answer" placeholder="your answer" />' +
       '<button type="button" class="wac-cw-submit">Verify</button>'
     );
+    // Built via the DOM API, not string-concatenated into showExpand()'s
+    // innerHTML, on purpose: the bundled providers' own image_data_uri
+    // is always a safe, server-generated base64 data URI, but a custom
+    // CaptchaProvider (an explicit, first-class extension point this
+    // package encourages) could put attacker-controlled content there --
+    // e.g. `x" onerror="...` -- which innerHTML would parse and execute
+    // as real HTML/JS. Assigning to the `.src` PROPERTY here never
+    // parses its value as markup; a malicious string just becomes an
+    // inert (at worst, broken) image URL, closing that injection path
+    // regardless of what a given provider puts in this field.
+    var img = document.createElement('img');
+    img.alt = 'captcha';
+    img.src = challenge.image_data_uri;
+    this.expandEl.querySelector('.wac-cw-image-slot').appendChild(img);
     var self = this;
     this.expandEl.querySelector('.wac-cw-submit').addEventListener('click', function (e) {
       e.stopPropagation();

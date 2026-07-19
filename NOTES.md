@@ -38,6 +38,23 @@ gerçek (boş) bir `StaticBlocklistReputationChecker()` veriyor, yeni
 çalıştırmasında uyarı sayısı stabil (1, önceden var olan httpx
 deprecation notu — bizim değişikliğimizle ilgisiz).
 
+### Ek: `widget.js` XSS düzeltmesi de (aynı tur, kullanıcı "başka bir şey var mı" diye sorunca)
+
+Güvenlik taramasındaki son açık kalem de kapatıldı:
+`renderImageChallenge()`, `challenge.image_data_uri`'yi `innerHTML`
+string'ine concat ediyordu — yerleşik provider'larda güvenli (sunucu
+üretimi base64 data URI) ama custom bir `CaptchaProvider` saldırgan-
+etkili veri koyarsa gerçek XSS. Görsel çıktıyı DEĞİŞTİRMEDEN
+(`document.createElement('img')` + `.src` PROPERTY ataması — `.src`'ye
+atama hiçbir zaman markup olarak parse edilmiyor, `innerHTML`'in
+aksine) düzeltildi. Frontend dosyası ama tek satırlık/mekanik bir
+değişiklik olduğu için (görünen davranış birebir aynı) fiziksel test
+turu beklemeden yapıldı — `node --check` ile sözdizimi doğrulandı,
+otomatik bir regresyon testi eklendi (`<img src="` artık script
+metninde YOK, `img.src = challenge.image_data_uri` VAR). Bir sonraki
+fiziksel test turunda gözle bir kez teyit edilmesi yeterli, ayrı bir
+tur gerekmiyor. 360 test yeşil.
+
 ## Performans/verimlilik araştırması + kapsamlı öneri listesi (5. tur)
 
 Kullanıcı "eş zamanlı worker/kuyruk sistemi ekleyelim mi" diye sordu;
