@@ -2,6 +2,7 @@
 provider logic (issue/verify) is covered separately in
 tests/unit/test_captcha_providers.py."""
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
@@ -25,12 +26,23 @@ from webapi_captcha.sql import (
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncEngine:
-    return create_async_engine(
+async def engine() -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
+    try:
+        yield engine
+    finally:
+        # Without this, aiosqlite's background worker thread for this
+        # engine's connection can still be tearing itself down (posting
+        # back to this test's event loop) after pytest has already
+        # closed that loop for the next test -- harmless in outcome, but
+        # noisy (a stray PytestUnhandledThreadExceptionWarning) in a full
+        # suite run. dispose() waits for the pool's connections to close
+        # cleanly before this fixture (and its event loop) goes away.
+        await engine.dispose()
 
 
 def _pending(challenge_id: str = "c1", answer: str = "42") -> PendingCaptcha:

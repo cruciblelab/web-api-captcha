@@ -4,6 +4,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **`TrustTokenVerifier.verify()` accepts optional `expected_subject_id`/
+  `required_purpose` binding checks.** Closes a gap flagged in a security
+  self-review: by default a valid trust receipt from a trusted issuer was
+  accepted for ANY `subject_id`, with binding it to the current visitor
+  left entirely to the caller. Passing either now makes `verify()`
+  enforce it itself (a mismatch fails closed, same as every other
+  problem it already returns `None` for). Threaded through
+  `AdaptiveCaptchaGate.is_currently_trusted()`/`get_info()`/`verify()`
+  and `PageGuard.require_human()` as the same two optional keyword-only
+  parameters. Purely additive -- omitting both is byte-for-byte today's
+  behavior.
+- **Fixed test-suite noise**: the SQL `engine` pytest fixture
+  (`tests/test_captcha_stores.py`) never disposed its `AsyncEngine`,
+  which could leave aiosqlite's background worker thread tearing down
+  after pytest had already closed that test's event loop for the next
+  test -- harmless in outcome, but a real, now-fixed source of spurious
+  `PytestUnhandledThreadExceptionWarning`s in full-suite runs.
 - **`ConditionalRiskSignal`** (`webapi_captcha.risk`): runs a `then`
   signal ONLY when a `when` signal flags first -- "if IP reputation is
   suspicious, THEN also run this deeper/more-expensive check",

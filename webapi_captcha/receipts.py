@@ -133,7 +133,25 @@ class TrustTokenVerifier:
     def __init__(self, trusted_issuers: dict[str, Ed25519PublicKey]) -> None:
         self.trusted_issuers = dict(trusted_issuers)
 
-    def verify(self, token: str) -> TrustReceipt | None:
+    def verify(
+        self,
+        token: str,
+        *,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
+    ) -> TrustReceipt | None:
+        """`expected_subject_id`/`required_purpose`: optional binding
+        checks, both `None` (no binding at all) by default -- see the
+        module docstring's honest limitation about this. Without them, a
+        valid receipt for ANY `subject_id` from a trusted issuer is
+        accepted; the caller is then responsible for making sure the
+        token it handed in actually belongs to the current visitor (e.g.
+        it extracted the token from that visitor's own cookie/session).
+        Pass `expected_subject_id=` (the local id you believe this token
+        should belong to) and/or `required_purpose=` to have `verify()`
+        enforce that itself instead -- a mismatch on either is treated
+        exactly like every other failure mode here: fails closed,
+        returns `None`, never raises."""
         try:
             payload_part, signature_part = token.split(".")
             payload = _b64decode(payload_part)
@@ -146,6 +164,10 @@ class TrustTokenVerifier:
             public_key.verify(signature, payload)
 
             if datetime.now(UTC) > receipt.expires_at:
+                return None
+            if expected_subject_id is not None and receipt.subject_id != expected_subject_id:
+                return None
+            if required_purpose is not None and receipt.purpose != required_purpose:
                 return None
             return receipt
         except Exception:  # noqa: BLE001

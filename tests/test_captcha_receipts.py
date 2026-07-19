@@ -69,3 +69,66 @@ def test_verify_rejects_valid_base64_but_invalid_json() -> None:
     signature = key.sign(garbage_payload)
     token = f"{_b64encode(garbage_payload)}.{_b64encode(signature)}"
     assert verifier.verify(token) is None
+
+
+# -- subject/purpose binding (expected_subject_id / required_purpose) --
+
+
+def test_verify_accepts_a_matching_expected_subject_id() -> None:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1))
+
+    receipt = verifier.verify(token, expected_subject_id="visitor-42")
+
+    assert receipt is not None
+    assert receipt.subject_id == "visitor-42"
+
+
+def test_verify_rejects_a_mismatched_expected_subject_id() -> None:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1))
+
+    assert verifier.verify(token, expected_subject_id="someone-else") is None
+
+
+def test_verify_accepts_a_matching_required_purpose() -> None:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1), purpose="checkout")
+
+    receipt = verifier.verify(token, required_purpose="checkout")
+
+    assert receipt is not None
+
+
+def test_verify_rejects_a_mismatched_required_purpose() -> None:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1), purpose="checkout")
+
+    assert verifier.verify(token, required_purpose="login") is None
+
+
+def test_verify_rejects_required_purpose_when_receipt_has_none() -> None:
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1))  # no purpose
+
+    assert verifier.verify(token, required_purpose="checkout") is None
+
+
+def test_verify_with_no_binding_params_accepts_any_subject_and_purpose() -> None:
+    """Regression guard: omitting both stays today's unbounded behavior."""
+    key = Ed25519PrivateKey.generate()
+    issuer = TrustTokenIssuer(key, issuer_id="site-a")
+    verifier = TrustTokenVerifier({"site-a": key.public_key()})
+    token = issuer.issue("visitor-42", ttl=timedelta(hours=1), purpose="checkout")
+
+    assert verifier.verify(token) is not None

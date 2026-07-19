@@ -607,3 +607,38 @@ async def test_escalation_without_a_configured_provider_raises_a_clear_error() -
         raise AssertionError("expected a ValueError when escalating with no provider configured")
     except ValueError:
         pass
+
+
+async def test_is_currently_trusted_rejects_a_token_for_a_different_subject() -> None:
+    issuer, verifier = _make_verifier()
+    gate = _make_gate(trust_store=None, trust_token_verifier=verifier)
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1))
+
+    trusted = await gate.is_currently_trusted(
+        100, trust_token=token, expected_subject_id="visitor-2"
+    )
+    assert trusted is False
+
+
+async def test_is_currently_trusted_accepts_a_token_for_the_expected_subject() -> None:
+    issuer, verifier = _make_verifier()
+    gate = _make_gate(trust_store=None, trust_token_verifier=verifier)
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1))
+
+    trusted = await gate.is_currently_trusted(
+        100, trust_token=token, expected_subject_id="visitor-1"
+    )
+    assert trusted is True
+
+
+async def test_is_currently_trusted_enforces_required_purpose() -> None:
+    issuer, verifier = _make_verifier()
+    gate = _make_gate(trust_store=None, trust_token_verifier=verifier)
+    token = issuer.issue("visitor-1", ttl=timedelta(hours=1), purpose="checkout")
+
+    assert await gate.is_currently_trusted(
+        100, trust_token=token, required_purpose="login"
+    ) is False
+    assert await gate.is_currently_trusted(
+        100, trust_token=token, required_purpose="checkout"
+    ) is True

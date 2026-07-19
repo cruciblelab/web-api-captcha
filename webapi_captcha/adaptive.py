@@ -283,6 +283,8 @@ class AdaptiveCaptchaGate:
         *,
         client_ip: str | None = None,
         trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> bool:
         """Whether `user_id` is trusted *right now*, without minting or
         touching any verification token -- the piece `PageGuard` needs to
@@ -316,10 +318,22 @@ class AdaptiveCaptchaGate:
         in this package (an exception here does not revoke trust) --
         unlike `TrustTokenVerifier.verify()`, this is an extra layer of
         scrutiny ON TOP of an already-granted trust, not the thing
-        granting it."""
+        granting it.
+
+        `expected_subject_id`/`required_purpose`: passed straight through
+        to `TrustTokenVerifier.verify()` -- see its docstring. Without
+        these, a valid receipt for ANY subject from a trusted issuer is
+        accepted; pass the local id you expect this token to belong to
+        (and/or the purpose you expect it to have been issued for) to
+        have this enforced instead of left entirely to the caller."""
         trusted = False
         if trust_token is not None and self.trust_token_verifier is not None:
-            if self.trust_token_verifier.verify(trust_token) is not None:
+            receipt = self.trust_token_verifier.verify(
+                trust_token,
+                expected_subject_id=expected_subject_id,
+                required_purpose=required_purpose,
+            )
+            if receipt is not None:
                 trusted = True
         if not trusted and self.trust_store is not None:
             trusted = await self.trust_store.is_trusted(
@@ -452,7 +466,13 @@ class AdaptiveCaptchaGate:
         return request
 
     async def get_info(
-        self, token: str, *, client_ip: str | None = None, trust_token: str | None = None
+        self,
+        token: str,
+        *,
+        client_ip: str | None = None,
+        trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> dict[str, Any] | None:
         """Same shape as `CaptchaGate.get_info()` -- what the frontend
         needs to render the right thing, including the same "already
@@ -460,7 +480,8 @@ class AdaptiveCaptchaGate:
         page reload after success must not look like an expired link).
         Making/persisting the escalation decision (if not already made)
         happens here, since this is the first point at which the
-        connecting IP is known. `trust_token`: see `is_currently_trusted`."""
+        connecting IP is known. `trust_token`/`expected_subject_id`/
+        `required_purpose`: see `is_currently_trusted`."""
         request = await self._get_live(token)
         if request is None:
             return None
@@ -471,7 +492,14 @@ class AdaptiveCaptchaGate:
                 "requires_account": self.require_account,
                 "verified": True,
             }
-        decision = await self._resolve_decision(token, request, client_ip, trust_token=trust_token)
+        decision = await self._resolve_decision(
+            token,
+            request,
+            client_ip,
+            trust_token=trust_token,
+            expected_subject_id=expected_subject_id,
+            required_purpose=required_purpose,
+        )
         return {
             "challenge": decision.challenge,
             "requires_captcha": decision.requires_captcha,
@@ -489,6 +517,8 @@ class AdaptiveCaptchaGate:
         client_ip: str | None = None,
         user_agent: str | None = None,
         trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> CheckResult:
         """Same contract as `CaptchaGate.verify()`. Reuses whatever
         escalation decision `get_info()` already made for this token
@@ -522,7 +552,13 @@ class AdaptiveCaptchaGate:
                     return CheckResult(verified=True, passed=[])
 
                 decision = await self._resolve_decision_locked(
-                    token, request, client_ip, signals=signals, trust_token=trust_token
+                    token,
+                    request,
+                    client_ip,
+                    signals=signals,
+                    trust_token=trust_token,
+                    expected_subject_id=expected_subject_id,
+                    required_purpose=required_purpose,
                 )
                 # The check that reads ctx.request.challenge (CaptchaCheck)
                 # needs it there -- AdaptiveDecision is kept in its own
@@ -607,6 +643,8 @@ class AdaptiveCaptchaGate:
         *,
         signals: dict[str, Any] | None = None,
         trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> AdaptiveDecision:
         """Acquires this token's lock itself -- for callers (`get_info`)
         that don't already hold it. `verify()` holds the lock for its
@@ -618,7 +656,13 @@ class AdaptiveCaptchaGate:
         try:
             async with lock:
                 return await self._resolve_decision_locked(
-                    token, request, client_ip, signals=signals, trust_token=trust_token
+                    token,
+                    request,
+                    client_ip,
+                    signals=signals,
+                    trust_token=trust_token,
+                    expected_subject_id=expected_subject_id,
+                    required_purpose=required_purpose,
                 )
         finally:
             self._token_locks.pop(token, None)
@@ -631,13 +675,19 @@ class AdaptiveCaptchaGate:
         *,
         signals: dict[str, Any] | None = None,
         trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> AdaptiveDecision:
         existing = await self.decision_store.get(token)
         if existing is not None:
             return existing
 
         trusted = await self.is_currently_trusted(
-            request.user_id, client_ip=client_ip, trust_token=trust_token
+            request.user_id,
+            client_ip=client_ip,
+            trust_token=trust_token,
+            expected_subject_id=expected_subject_id,
+            required_purpose=required_purpose,
         )
 
         requires_captcha = False

@@ -458,6 +458,21 @@ returns `None`), the one deliberate exception to this package's usual
 fail-open philosophy, since a receipt grants trust outright rather than
 contributing a soft signal.
 
+By default, `verify()` accepts a valid receipt for ANY `subject_id` from
+a trusted issuer -- it's on you, the caller, to make sure the token you
+hand in actually belongs to the current visitor (e.g. you extracted it
+from that visitor's own cookie/session). Pass `expected_subject_id=`
+(and/or `required_purpose=`) -- to `TrustTokenVerifier.verify()` directly,
+or through `AdaptiveCaptchaGate.is_currently_trusted()`/`get_info()`/
+`verify()`/`PageGuard.require_human()` -- to have that binding enforced
+instead of left entirely to you:
+
+```python
+await guard.require_human(
+    request, trust_token=extracted_token, expected_subject_id=str(visitor_id)
+)
+```
+
 ## Using this with discord-webapi
 
 If you're also using [discord-webapi](https://github.com/cruciblelab/discord-webapi),

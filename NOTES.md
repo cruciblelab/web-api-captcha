@@ -7,6 +7,37 @@
 > `CHANGELOG.md` neyin değiştiğini, bu dosya NEDEN öyle tasarlandığını
 > anlatıyor.
 
+## Fiziksel test gerektirmeyen iki iş: trust receipt binding + test hijyeni (7. tur)
+
+Kullanıcı sonnet-5'e geri dönüp "fiziksel teste kadar ne yapabiliriz"
+diye sordu. Önceki güvenlik taramasında bulduğum ama o zaman "kapsam
+dışı, dokümante edilmiş bir sınır" dediğim iki maddeyi somutlaştırdım —
+ikisi de tamamen backend, sıfır fiziksel test yükü:
+
+1. **`TrustTokenVerifier.verify(token, *, expected_subject_id=None,
+   required_purpose=None)`** — artık isteğe bağlı olarak receipt'in
+   `subject_id`/`purpose`'ını doğrulayabiliyor, uyuşmazlıkta `None`
+   dönüyor (aynı fail-closed disiplini). `AdaptiveCaptchaGate.
+   is_currently_trusted()`/`get_info()`/`verify()` ve `PageGuard.
+   require_human()`'a aynı iki opsiyonel parametre olarak taşındı.
+   Varsayılan (ikisi de None) davranış birebir aynı — çağıran hâlâ
+   isterse hiç binding yapmadan kullanabilir.
+2. **SQL test fixture'ı artık `engine.dispose()` çağırıyor** — tam
+   suite'te aralıklı görülen `PytestUnhandledThreadExceptionWarning`
+   gürültüsünün kaynağıydı (aiosqlite'in arka plan thread'i, pytest bir
+   sonraki testin event loop'unu kapattıktan sonra hâlâ eski loop'a
+   sinyal göndermeye çalışıyordu). 3 kere art arda tam suite çalıştırılıp
+   uyarının tamamen kaybolduğu doğrulandı.
+
+Preset (`build_cloudflare_style_guard`) kontrol edildi, değişiklik
+gerekmedi — zaten `reputation=None` geçilse bile gate'e her zaman
+gerçek (boş) bir `StaticBlocklistReputationChecker()` veriyor, yeni
+"reputation VEYA risk_engine zorunlu" kuralına zaten uyumlu.
+
+359 test yeşil (350 → 359), ruff/mypy temiz, 3 art arda tam suite
+çalıştırmasında uyarı sayısı stabil (1, önceden var olan httpx
+deprecation notu — bizim değişikliğimizle ilgisiz).
+
 ## Performans/verimlilik araştırması + kapsamlı öneri listesi (5. tur)
 
 Kullanıcı "eş zamanlı worker/kuyruk sistemi ekleyelim mi" diye sordu;

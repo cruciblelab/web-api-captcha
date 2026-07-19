@@ -139,6 +139,8 @@ class PageGuard:
         metadata: dict[str, Any] | None = None,
         min_level: RiskLevel | None = None,
         trust_token: str | None = None,
+        expected_subject_id: str | None = None,
+        required_purpose: str | None = None,
     ) -> str | None:
         """Call at the top of a protected route. Raises `PageGuardRedirect`
         if this visitor needs to solve a captcha before proceeding.
@@ -154,7 +156,12 @@ class PageGuard:
         `webapi_captcha.receipts`/`AdaptiveCaptchaGate.is_currently_
         trusted`) -- this package never reads it from `request` itself;
         extract it from wherever your app keeps it (a header, a cookie,
-        your own session) and pass the raw string in."""
+        your own session) and pass the raw string in. `expected_subject_
+        id`/`required_purpose`: passed straight through to `TrustTokenVerifier
+        .verify()` -- pass the local visitor id you expect this token to
+        belong to (and/or the purpose you expect it to have been issued
+        for) to have that binding enforced instead of left entirely to
+        you as the caller."""
         client_ip = request.client.host if request.client else None
         new_cookie_value: str | None = None
 
@@ -168,7 +175,11 @@ class PageGuard:
             visitor_id = _pseudo_user_id(raw)
 
         if await self.gate.is_currently_trusted(
-            visitor_id, client_ip=client_ip, trust_token=trust_token
+            visitor_id,
+            client_ip=client_ip,
+            trust_token=trust_token,
+            expected_subject_id=expected_subject_id,
+            required_purpose=required_purpose,
         ):
             return new_cookie_value
 
