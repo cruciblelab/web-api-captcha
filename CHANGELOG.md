@@ -4,6 +4,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **Fixed**: `ReCaptchaProvider`/`HCaptchaProvider`/`TurnstileProvider`
+  opened a brand new `httpx.AsyncClient()` and closed it immediately
+  after on every single `verify()` call (unless you passed your own
+  `http_client=`) -- a full TCP+TLS handshake on every verification,
+  real latency/resource cost under any real volume. Each provider now
+  lazily creates and reuses ONE client across every call (new shared
+  `webapi_captcha.providers._http._LazyHttpClientMixin`); a new
+  `await provider.aclose()` closes it on shutdown. Purely a default-
+  behavior fix -- passing `http_client=` yourself is unaffected (that
+  client's lifecycle was and still is entirely yours).
 - **`TieredTrustStore`/`TieredRunningRiskStore`** (`webapi_captcha.tiered`,
   new module): fast/slow cache-aside composition for any two
   `TrustStore`/`RunningRiskStore` implementations -- writes go to both

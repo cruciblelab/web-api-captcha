@@ -10,17 +10,23 @@ from __future__ import annotations
 import httpx
 
 from webapi_captcha.models import CaptchaChallenge
+from webapi_captcha.providers._http import _LazyHttpClientMixin
 
 _VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 
 
-class ReCaptchaProvider:
+class ReCaptchaProvider(_LazyHttpClientMixin):
     """Get `site_key`/`secret_key` from
     https://www.google.com/recaptcha/admin. Embed reCAPTCHA's own JS
     (`https://www.google.com/recaptcha/api.js`) plus a
     `<div class="g-recaptcha" data-sitekey="...">` on your page using the
     `site_key` this returns -- this class only handles server-side
     verification, it doesn't render or serve Google's widget itself.
+
+    Reuses one internally-created `httpx.AsyncClient` across every
+    `verify()` call (see `_LazyHttpClientMixin`) instead of opening and
+    closing a fresh one each time -- call `await provider.aclose()` on
+    app shutdown if you didn't pass your own `http_client=`.
     """
 
     kind = "recaptcha"
@@ -34,7 +40,7 @@ class ReCaptchaProvider:
     ) -> None:
         self.site_key = site_key
         self._secret_key = secret_key
-        self._external_http_client = http_client
+        self._init_http_client(http_client)
 
     async def issue(self) -> CaptchaChallenge:
         # No server-side challenge state to create -- Google's widget IS
@@ -49,7 +55,7 @@ class ReCaptchaProvider:
         )
 
     async def verify(self, challenge_id: str, response: str) -> bool:
-        client = self._external_http_client or httpx.AsyncClient()
+        client = self._http_client()
         try:
             resp = await client.post(
                 _VERIFY_URL, data={"secret": self._secret_key, "response": response}
@@ -67,6 +73,3 @@ class ReCaptchaProvider:
             # here as an unhandled 500 instead of the documented
             # fail-closed `False`.
             return False
-        finally:
-            if self._external_http_client is None:
-                await client.aclose()

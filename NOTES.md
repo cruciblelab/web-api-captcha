@@ -7,6 +7,48 @@
 > `CHANGELOG.md` neyin değiştiğini, bu dosya NEDEN öyle tasarlandığını
 > anlatıyor.
 
+## Performans/verimlilik araştırması + kapsamlı öneri listesi (5. tur)
+
+Kullanıcı "eş zamanlı worker/kuyruk sistemi ekleyelim mi" diye sordu;
+konuşurken kendisi de fark etti ki captcha doğası gereği senkron
+istek-cevap, kuyruğa almak anlamsız — bunun yerine "mevcut hâli maksimum
+verimli hale getirelim, çok kaynak tüketiyor, insanlar kullanmazsa
+anlamı yok" diye yön değiştirdi. Bu isteğe gerçek araştırma (WebSearch,
+kod okuma) ile karşılık verildi; tam liste **`docs/PERFORMANCE_SECURITY_
+PROPOSAL.md`** dosyasında — bu not sadece özet/karar kaydı, ayrıntı
+için o dosyaya bakın.
+
+**Kod okuyarak bulunan gerçek bug**: `providers/{recaptcha,hcaptcha,
+turnstile}.py`'nin üçü de her `verify()` çağrısında `http_client=`
+verilmediği sürece sıfırdan bir `httpx.AsyncClient()` açıp hemen
+kapatıyor — her doğrulamada TCP+TLS handshake'i baştan yapıyor. Bu,
+muhtemelen "aşırı kaynak tüketimi" hissinin gerçek kaynağı, en yüksek
+etki/en düşük riskli düzeltme. **Bu turda SADECE bu düzeltiliyor**
+(aşağıya bakın) — kullanıcının kararı: "aşırı kapsamlı vermeyelim,
+şu an overengineering olur, kimse kullanmaya başlamadan testler aşırı
+zorlaşır, küçük bir kısmını ekleyelim, bu bug'ı kapatmak yeterli."
+
+**Araştırmayla bulunan, ama BİLEREK ERTELENEN üç fikir** (ayrı, kendi
+başlarına derinlemesine tur gerektiriyor, şimdi kod yazılmadı):
+1. **JA4 TLS parmak izi sinyali** — gerçek, güncel (Auth0 kullanıyor)
+   ama sadece reverse-proxy fingerprint'i header'a enjekte ederse
+   anlamlı (çıplak Uvicorn/FastAPI TLS'i göremez).
+2. **WebAuthn tabanlı cihaz güveni** — gerçek, olgun bir Python
+   kütüphanesi VAR (`webauthn`/py_webauthn, Production/Stable) — ama
+   gerçek frontend JS işi gerektiriyor, ayrı bir tur.
+3. **Apple/Cloudflare Private Access Token DOĞRULAYICISI** (issuer
+   değil!) — en heyecan verici fikir: PAT zaten canlı, Cloudflare 2022'den
+   beri issuer, gerçek prodüksiyon verisi (Apple-ağırlıklı trafikte
+   %8-14 dönüşüm artışı). Doğrulama adımı teorik olarak standart
+   RSA-PSS (blind kısmı sadece ihraçta), yani `cryptography` ile
+   YAPILABİLİR olabilir — ama RFC 9578'in tam HTTP header/JWKS
+   protokolü netleşmeden kod yazılmayacak, ayrı bir araştırma turu.
+
+Diğer küçük/orta öneriler (fire-and-forget tiered yazma,
+CachingIPReputationChecker, singleflight, timeout/circuit-breaker
+config'leri, orjson, "en iyi varsayılan" preset) hepsi dosyada
+listeli, hiçbiri bu turda yapılmadı — bilinçli olarak.
+
 ## Dayanıklılık düzeltmesi + "güvenilir" artık koşulsuz bypass değil (4. netleştirme turu)
 
 Kullanıcının iki somut isteği: (1) kesinti/çökmede veri kaybı/yazma

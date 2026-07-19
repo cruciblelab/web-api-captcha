@@ -12,17 +12,23 @@ from __future__ import annotations
 import httpx
 
 from webapi_captcha.models import CaptchaChallenge
+from webapi_captcha.providers._http import _LazyHttpClientMixin
 
 _VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
 
-class TurnstileProvider:
+class TurnstileProvider(_LazyHttpClientMixin):
     """Get `site_key`/`secret_key` from
     https://dash.cloudflare.com/?to=/:account/turnstile. Embed Turnstile's
     own JS (`https://challenges.cloudflare.com/turnstile/v0/api.js`) plus a
     `<div class="cf-turnstile" data-sitekey="...">` on your page using the
     `site_key` this returns -- this class only handles server-side
     verification, it doesn't render or serve Turnstile's widget itself.
+
+    Reuses one internally-created `httpx.AsyncClient` across every
+    `verify()` call (see `_LazyHttpClientMixin`) -- call `await
+    provider.aclose()` on app shutdown if you didn't pass your own
+    `http_client=`.
     """
 
     kind = "turnstile"
@@ -36,7 +42,7 @@ class TurnstileProvider:
     ) -> None:
         self.site_key = site_key
         self._secret_key = secret_key
-        self._external_http_client = http_client
+        self._init_http_client(http_client)
 
     async def issue(self) -> CaptchaChallenge:
         return CaptchaChallenge(
@@ -47,7 +53,7 @@ class TurnstileProvider:
         )
 
     async def verify(self, challenge_id: str, response: str) -> bool:
-        client = self._external_http_client or httpx.AsyncClient()
+        client = self._http_client()
         try:
             resp = await client.post(
                 _VERIFY_URL, data={"secret": self._secret_key, "response": response}
@@ -62,6 +68,3 @@ class TurnstileProvider:
             # `json.JSONDecodeError` (a `ValueError`), which must not
             # propagate uncaught as an unhandled 500.
             return False
-        finally:
-            if self._external_http_client is None:
-                await client.aclose()

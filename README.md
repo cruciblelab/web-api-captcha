@@ -170,7 +170,11 @@ inheritance needed:
   signals.
 - **Third-party widgets** -- `ReCaptchaProvider`, `HCaptchaProvider`,
   `TurnstileProvider` (bring your own site/secret keys). Only `httpx`
-  needed.
+  needed. Each lazily creates and reuses ONE `httpx.AsyncClient` across
+  every `verify()` call (not a fresh one per call -- a real TCP+TLS
+  handshake saved on every verification) -- pass your own `http_client=`
+  to share a client across providers/your whole app instead, and call
+  `await provider.aclose()` on shutdown if you didn't.
 - **`FallbackCaptchaProvider`** -- tries several providers in order (e.g.
   Turnstile, falling back to a self-hosted one if the third-party service
   is unreachable).

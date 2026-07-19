@@ -205,3 +205,71 @@ async def test_turnstile_verify_fails_closed_on_valid_json_that_is_not_an_object
     ok = await provider.verify("site-xyz", "widget-response-token")
 
     assert ok is False
+
+
+# -- lazy, reused httpx.AsyncClient (see webapi_captcha.providers._http) --
+
+
+@respx.mock
+async def test_recaptcha_reuses_the_same_internally_created_client_across_calls() -> None:
+    respx.post("https://www.google.com/recaptcha/api/siteverify").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    provider = ReCaptchaProvider(site_key="site-123", secret_key="secret-456")
+
+    await provider.verify("site-123", "token-1")
+    first_client = provider._owned_http_client
+    await provider.verify("site-123", "token-2")
+    second_client = provider._owned_http_client
+
+    assert first_client is not None
+    assert first_client is second_client  # no fresh client per call
+
+
+async def test_recaptcha_aclose_closes_the_internally_created_client() -> None:
+    provider = ReCaptchaProvider(site_key="site-123", secret_key="secret-456")
+    provider._http_client()  # force lazy creation without a real network call
+
+    await provider.aclose()
+
+    assert provider._owned_http_client is None
+
+
+async def test_recaptcha_aclose_never_touches_an_externally_supplied_client() -> None:
+    external = httpx.AsyncClient()
+    provider = ReCaptchaProvider(
+        site_key="site-123", secret_key="secret-456", http_client=external
+    )
+
+    await provider.aclose()  # must be a no-op for a caller-owned client
+
+    assert external.is_closed is False
+    await external.aclose()
+
+
+@respx.mock
+async def test_hcaptcha_reuses_the_same_internally_created_client_across_calls() -> None:
+    respx.post("https://hcaptcha.com/siteverify").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    provider = HCaptchaProvider(site_key="site-abc", secret_key="secret-def")
+
+    await provider.verify("site-abc", "token-1")
+    await provider.verify("site-abc", "token-2")
+
+    assert provider._external_http_client is None
+    assert provider._owned_http_client is not None
+
+
+@respx.mock
+async def test_turnstile_reuses_the_same_internally_created_client_across_calls() -> None:
+    respx.post("https://challenges.cloudflare.com/turnstile/v0/siteverify").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    provider = TurnstileProvider(site_key="site-xyz", secret_key="secret-ghi")
+
+    await provider.verify("site-xyz", "token-1")
+    await provider.verify("site-xyz", "token-2")
+
+    assert provider._external_http_client is None
+    assert provider._owned_http_client is not None
