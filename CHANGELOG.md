@@ -4,6 +4,25 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- **`ConditionalRiskSignal`** (`webapi_captcha.risk`): runs a `then`
+  signal ONLY when a `when` signal flags first -- "if IP reputation is
+  suspicious, THEN also run this deeper/more-expensive check",
+  generalized to any two signals (neither has to be IP reputation), and
+  chainable (`A → B → C`). Lets an expensive/paid/slow signal be gated
+  behind a cheap one so it never runs on traffic the cheap check already
+  cleared -- something `RiskEngine`'s own ordering/`short_circuit_on_
+  override` couldn't express (those blend every signal; this skips the
+  follow-up's call entirely).
+- **`AdaptiveCaptchaGate` `reputation` is now optional.** Pass a
+  `risk_engine` and omit `reputation` to drop the built-in IP-reputation
+  path entirely and decide purely from your engine. `decision_store` and
+  `escalation_provider` are optional too (a `MemoryAdaptiveDecisionStore`
+  is created by default; a genuinely-needed-but-missing escalation
+  provider now raises a clear `ValueError` instead of an `AttributeError`
+  on `None`). Passing neither `reputation` nor `risk_engine` raises a
+  `ValueError` at construction -- that combination could never escalate.
+  Purely additive: existing positional `AdaptiveCaptchaGate(transport,
+  store, reputation, provider, decision_store, ...)` calls are unchanged.
 - **Fixed**: `ReCaptchaProvider`/`HCaptchaProvider`/`TurnstileProvider`
   opened a brand new `httpx.AsyncClient()` and closed it immediately
   after on every single `verify()` call (unless you passed your own

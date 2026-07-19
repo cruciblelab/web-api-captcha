@@ -282,6 +282,39 @@ risk_engine = RiskEngine([
 `min_agreements=` (default: every enabled child) lets you require k-of-n
 instead of strict AND.
 
+**Building your own conditional chains** -- `ConditionalRiskSignal(when=A,
+then=B)` runs `B` ONLY when `A` flags first, so an expensive/paid check
+(`B`) never runs on the traffic a cheap check (`A`) already cleared:
+
+```python
+from webapi_captcha import ConditionalRiskSignal, ReputationRiskSignal, RiskEngine
+
+risk_engine = RiskEngine([
+    ConditionalRiskSignal(
+        when=ReputationRiskSignal(cheap_blocklist),  # cheap gatekeeper
+        then=MyPaidFraudScoreSignal(api_key=...),     # only runs if the IP looks bad
+    ),
+])
+```
+Chainable (`when=A, then=ConditionalRiskSignal(when=B, then=C)` gives
+`A → B → C`), and nothing here is hardcoded to IP reputation -- `when`
+and `then` are any two signals you like.
+
+**Dropping the built-in IP-reputation path entirely** -- `reputation` is
+optional on `AdaptiveCaptchaGate`. Pass a `risk_engine` and omit it, and
+the gate decides purely from your engine (which may or may not itself
+include a `ReputationRiskSignal` -- your chain, your call):
+
+```python
+gate = AdaptiveCaptchaGate(
+    transport, store,
+    escalation_provider=provider,
+    risk_engine=my_engine,   # no `reputation=` at all
+)
+```
+(Passing neither `reputation` nor `risk_engine` is a config error -- with
+neither, the gate could never escalate.)
+
 **Replay detection feeding the same risk decision** -- `ReplayRiskSignal`
 bridges the existing cross-request replay defense
 (`RepeatedMovementCheck`/`TrajectoryFingerprintStore`) into `RiskEngine`,

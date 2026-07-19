@@ -187,9 +187,9 @@ class AdaptiveCaptchaGate:
         self,
         transport: Transport,
         store: VerificationStore,
-        reputation: IPReputationChecker,
-        escalation_provider: CaptchaProvider,
-        decision_store: AdaptiveDecisionStore,
+        reputation: IPReputationChecker | None = None,
+        escalation_provider: CaptchaProvider | None = None,
+        decision_store: AdaptiveDecisionStore | None = None,
         *,
         require_account: bool = False,
         extra_checks: Sequence[VerificationCheck] | None = None,
@@ -207,11 +207,27 @@ class AdaptiveCaptchaGate:
         trusted_revalidation: RiskSignal | None = None,
         trusted_revalidation_threshold: float = 0.5,
     ) -> None:
+        # `reputation` and `risk_engine` are two alternative ways to make
+        # the "how suspicious is this" decision -- you need AT LEAST one.
+        # `reputation=None` lets you drop the built-in IP-reputation path
+        # ENTIRELY and decide purely from a `risk_engine` (which may or
+        # may not itself include a `ReputationRiskSignal` -- your call,
+        # your chain). Both `None` is the one combination that can never
+        # escalate, so it's a config error rather than a silent no-op.
+        if reputation is None and risk_engine is None:
+            raise ValueError(
+                "AdaptiveCaptchaGate needs a reputation checker OR a risk_engine to make "
+                "any escalation decision -- with neither, it could never escalate. Pass a "
+                "risk_engine=... if you want to drop the built-in IP-reputation path."
+            )
         self.transport = transport
         self.store = store
         self.reputation = reputation
         self.escalation_provider = escalation_provider
-        self.decision_store = decision_store
+        # Zero-infrastructure default, matching every other Memory* store
+        # in this package -- so dropping `reputation` for a risk_engine no
+        # longer forces you to also spell out a decision_store by hand.
+        self.decision_store = decision_store or MemoryAdaptiveDecisionStore()
         self.require_account = require_account
         self.extra_checks: list[VerificationCheck] = list(extra_checks or [])
         self.trust_store = trust_store
@@ -362,6 +378,10 @@ class AdaptiveCaptchaGate:
                 floor = max(floor, running)
 
         if self.risk_engine is None:
+            # Reachable only when reputation is set: the constructor
+            # rejects reputation=None AND risk_engine=None together, so
+            # this branch (risk_engine is None) implies reputation is not.
+            assert self.reputation is not None
             suspicious = client_ip is not None and await self.reputation.is_suspicious(client_ip)
             level = max(floor, RiskLevel.HIGH if suspicious else RiskLevel.MINIMAL)
             return RiskAssessment(
@@ -387,11 +407,24 @@ class AdaptiveCaptchaGate:
         return assessment
 
     def escalation_provider_for(self, level: RiskLevel) -> CaptchaProvider:
-        """`escalation_providers.get(level, escalation_provider)` -- the
-        per-tier provider if one was configured for this level, else the
-        single default. The common single-provider case needs to
-        configure nothing here at all."""
-        return self.escalation_providers.get(level, self.escalation_provider)
+        """The per-tier provider if one was configured for this `level`
+        via `escalation_providers`, else the single default
+        `escalation_provider`. The common single-provider case needs to
+        configure nothing here at all.
+
+        Raises `ValueError` if neither is configured for a level that
+        actually needs to escalate -- `escalation_provider` is optional
+        at construction (a gate that only ever decides redirect-vs-allow
+        without issuing a challenge doesn't need one), so this is where a
+        genuinely-needed-but-missing provider surfaces as a clear error
+        instead of an `AttributeError` on `None.issue()`."""
+        provider = self.escalation_providers.get(level, self.escalation_provider)
+        if provider is None:
+            raise ValueError(
+                f"escalation to {level.name} needs a captcha provider, but neither "
+                f"escalation_provider nor escalation_providers[{level.name}] was configured"
+            )
+        return provider
 
     async def create_verification(
         self,

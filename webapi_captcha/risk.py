@@ -430,11 +430,7 @@ class CorroboratedRiskSignal:
             if contribution.suspicion is not None or contribution.hard_override is not None:
                 contributed += 1
 
-            agreed = contribution.hard_override is not None or (
-                contribution.suspicion is not None
-                and contribution.suspicion >= self.suspicion_threshold
-            )
-            if agreed:
+            if _signal_flags(contribution, self.suspicion_threshold):
                 flagged += 1
 
         if active == 0:
@@ -453,6 +449,89 @@ class CorroboratedRiskSignal:
         return RiskContribution(
             suspicion=flagged / active, detail=f"only {flagged}/{active} child signals agreed"
         )
+
+
+def _signal_flags(contribution: RiskContribution, threshold: float) -> bool:
+    """The shared "did this signal raise a concern" test used by both
+    `CorroboratedRiskSignal` and `ConditionalRiskSignal`: a `hard_override`
+    counts, or a graded `suspicion` at/above `threshold`. An abstention
+    (`suspicion=None`, no override) never counts as flagging."""
+    return contribution.hard_override is not None or (
+        contribution.suspicion is not None and contribution.suspicion >= threshold
+    )
+
+
+class ConditionalRiskSignal:
+    """Runs `then` ONLY when `when` flags first -- the "if IP reputation
+    is suspicious, THEN also run this deeper/more-expensive check" chain,
+    generalized to any two signals (neither has to be IP reputation).
+
+    Why this exists separately from `RiskEngine`'s own ordering: the
+    engine evaluates every signal and blends them; `short_circuit_on_
+    override` only lets an *override* stop later signals early. Neither
+    gives you "don't even RUN signal B unless cheap signal A already
+    looked suspicious" -- which is exactly what you want when B is a paid
+    fraud API, a slow third-party lookup, or any check you'd rather not
+    pay for on the ~99% of traffic that A already cleared. `when` is the
+    cheap gatekeeper; `then` is the expensive follow-up that only fires
+    behind it.
+
+    When `when` flags (`hard_override`, or `suspicion >= threshold`),
+    this signal's contribution IS `then`'s contribution -- so `then` can
+    hard-override, contribute a graded suspicion, or abstain, exactly as
+    it would standalone. When `when` does NOT flag, this abstains
+    (`suspicion=None`) WITHOUT running `then` at all -- that skipped call
+    is the whole point.
+
+    Chainable: `then` can itself be a `ConditionalRiskSignal`, so
+    `A -> B -> C` (run B only if A flags, run C only if B then flags) is
+    just `ConditionalRiskSignal(when=A, then=ConditionalRiskSignal(
+    when=B, then=C))`. Build whatever chain you want; nothing here is
+    hardcoded to reputation.
+
+    `when`/`then` each run inside their own `try`/`except` (an exception
+    is treated as an abstention -- and an exception in `when` means
+    `then` is NOT run), same fail-open ethos as `RiskEngine.assess()`.
+
+    Note the `when` signal does NOT itself contribute to the engine
+    through this wrapper -- only `then`'s result surfaces. If you also
+    want `when`'s own opinion counted (e.g. reputation's own override to
+    still apply independently), add `when` to the engine's signal list
+    separately too; the two compose cleanly.
+    """
+
+    def __init__(
+        self,
+        *,
+        when: RiskSignal,
+        then: RiskSignal,
+        threshold: float = 0.5,
+        name: str = "conditional",
+        weight: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        self.when = when
+        self.then = then
+        self.threshold = threshold
+        self.name = name
+        self.weight = weight
+        self.enabled = enabled
+
+    async def assess(self, ctx: RiskContext) -> RiskContribution:
+        try:
+            gate = await self.when.assess(ctx)
+        except Exception as exc:  # noqa: BLE001 -- fail open, see class docstring
+            return RiskContribution(suspicion=None, detail=f"when-signal raised: {exc!r}")
+
+        if not _signal_flags(gate, self.threshold):
+            return RiskContribution(
+                suspicion=None, detail=f"when-signal ({self.when.name}) did not flag"
+            )
+
+        try:
+            return await self.then.assess(ctx)
+        except Exception as exc:  # noqa: BLE001 -- fail open, see class docstring
+            return RiskContribution(suspicion=None, detail=f"then-signal raised: {exc!r}")
 
 
 class ReplayRiskSignal:

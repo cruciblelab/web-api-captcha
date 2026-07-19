@@ -49,6 +49,63 @@ CachingIPReputationChecker, singleflight, timeout/circuit-breaker
 config'leri, orjson, "en iyi varsayılan" preset) hepsi dosyada
 listeli, hiçbiri bu turda yapılmadı — bilinçli olarak.
 
+## Kompozisyon esnekliği: reputation opsiyonel + ConditionalRiskSignal (6. tur)
+
+Kullanıcının isteği (fable-5'e geçtikten sonra): "tam config edilebilir,
+bizim verdiklerimiz istediği sıra, IP itibarı şüpheliyse başka şeyler
+tetikleme gibi kendi zincirlerini kurabilsinler, IP itibarı sistemini
+tamamen çıkartabilsinler." Önce kodu gösterip neyin zaten mümkün olduğunu
+(SignalScoreCheck kendi heuristic'leri, RiskEngine sıralı liste + add/
+remove/get_signal + enabled toggle) neyin gerçekten eksik olduğunu
+ayırdım. İki gerçek eksik yapıldı:
+
+1. **`AdaptiveCaptchaGate.reputation` artık opsiyonel.** Eskiden 3.
+   positional zorunlu argümandı — RiskEngine kullansan bile boşuna bir
+   IP itibarı nesnesi vermek zorundaydın ("IP itibarını çıkartamıyorum"
+   şikayetinin tam kaynağı). Artık `reputation=None` + `risk_engine=...`
+   ile IP itibarı yolu tamamen düşürülebiliyor. `decision_store` ve
+   `escalation_provider` de opsiyonel yapıldı (decision_store yoksa
+   `MemoryAdaptiveDecisionStore` otomatik; escalation gerekip de provider
+   yoksa `AttributeError` yerine net `ValueError`). İkisi de (reputation
+   VE risk_engine) None ise construction'da `ValueError` — o kombinasyon
+   asla escalate edemezdi. Mevcut positional çağrılar hiç kırılmadı
+   (default'lar eklendi, positional geçenler değerlerini override ediyor).
+
+2. **`ConditionalRiskSignal(when=A, then=B)`** — B'yi sadece A "flag"
+   ederse çalıştırır. "IP itibarı şüpheliyse başka şeyleri tetikle"nin
+   genel hali: A ve B herhangi iki sinyal, IP itibarına bağlı değil,
+   zincirlenebilir (`A → B → C`). RiskEngine'in kendi sıralaması/
+   short_circuit'i bunu ifade EDEMİYORDU (onlar her sinyali harmanlıyor;
+   bu, takip sinyalinin çağrısını komple atlıyor) — pahalı/ücretli/yavaş
+   bir kontrolü ucuz bir kontrolün arkasına saklamak için. `when`/`then`
+   flag testi `CorroboratedRiskSignal` ile ortak `_signal_flags()`
+   yardımcısına çıkarıldı.
+
+350 test yeşil (338 → 350), ruff/mypy temiz.
+
+### Kullanıcının onayıyla ERTELENEN, "önerin çok kıymetli, notlarına ekle" denen widget işleri
+
+Kullanıcı bunları beğendi ama şimdi yapmadık, sonraki turlara kaldı
+(overengineering yapmamak için, kullanıcının önceki turlardaki disiplin
+isteğiyle tutarlı):
+
+- **Hazır widget görünümleri/temaları** — şu an `widget.js`'in TEK sabit
+  görünümü var (Cloudflare-Turnstile tarzı checkbox). 2-3 hazır tema
+  (light/dark/minimal/pill gibi) + `data-theme`/renk/etiket config'i
+  eklenecek. Kullanıcının "hazır widget görünümleri" isteğinin karşılığı.
+- **Genişletilebilir renderer sistemi** — yeni bir challenge türünün
+  frontend render'ını `widget.js`'i çatallamadan kaydedebilmek için bir
+  "renderer registry" (`window.wacRegisterChallengeRenderer(kind, fn)`
+  gibi). Şu an render mantığı içeride sabit bir `switch`.
+- **`image_data_uri` innerHTML XSS tuzağı** (geçen turun güvenlik
+  taramasında bulundu) — `widget.js:253` `image_data_uri`'yi kaçışsız
+  innerHTML'e gömüyor. Yerleşik provider'larda güvenli (sunucu-üretimi
+  base64 data URI), ama custom provider bu alana saldırgan-etkili veri
+  koyarsa XSS. Renderer refactor'ı sırasında img'yi `createElement`+`.src`
+  ile kurarak kapatılacak. Düşük şiddet, canlı açık değil.
+- **Trust receipt `subject_id` binding'i** (aynı taramadan) — opsiyonel
+  `expected_subject_id`/`required_purpose` doğrulaması, bir gün.
+
 ## Dayanıklılık düzeltmesi + "güvenilir" artık koşulsuz bypass değil (4. netleştirme turu)
 
 Kullanıcının iki somut isteği: (1) kesinti/çökmede veri kaybı/yazma

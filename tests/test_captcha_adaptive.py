@@ -550,3 +550,60 @@ async def test_trusted_revalidation_threshold_is_configurable() -> None:
         trusted_revalidation_threshold=0.5,
     )
     assert await gate2.is_currently_trusted(100, client_ip="1.2.3.4") is False  # at/above
+
+
+# -- reputation is optional: drop the built-in IP-reputation path for a pure risk_engine --
+
+
+async def test_gate_can_be_built_with_no_reputation_when_a_risk_engine_is_given() -> None:
+    gate = AdaptiveCaptchaGate(
+        InProcessTransport(),
+        MemoryVerificationStore(),
+        escalation_provider=MathCaptchaProvider(MemoryCaptchaStore()),
+        risk_engine=RiskEngine([_OverrideSignal(RiskLevel.HIGH)]),
+    )
+    request = await gate.create_verification(user_id=100, purpose="signup")
+
+    info = await gate.get_info(request.token, client_ip="1.1.1.1")  # any IP -- no reputation used
+
+    assert info is not None
+    assert info["requires_captcha"] is True  # risk_engine alone drove the escalation
+
+
+async def test_gate_defaults_a_decision_store_when_omitted() -> None:
+    gate = AdaptiveCaptchaGate(
+        InProcessTransport(),
+        MemoryVerificationStore(),
+        escalation_provider=MathCaptchaProvider(MemoryCaptchaStore()),
+        risk_engine=RiskEngine([]),
+    )
+    from webapi_captcha.adaptive import MemoryAdaptiveDecisionStore
+
+    assert isinstance(gate.decision_store, MemoryAdaptiveDecisionStore)
+
+
+async def test_gate_rejects_neither_reputation_nor_risk_engine() -> None:
+    try:
+        AdaptiveCaptchaGate(
+            InProcessTransport(),
+            MemoryVerificationStore(),
+            escalation_provider=MathCaptchaProvider(MemoryCaptchaStore()),
+        )
+        raise AssertionError("expected a ValueError for a gate that could never escalate")
+    except ValueError:
+        pass
+
+
+async def test_escalation_without_a_configured_provider_raises_a_clear_error() -> None:
+    gate = AdaptiveCaptchaGate(
+        InProcessTransport(),
+        MemoryVerificationStore(),
+        risk_engine=RiskEngine([_OverrideSignal(RiskLevel.HIGH)]),
+    )  # no escalation_provider at all
+    request = await gate.create_verification(user_id=100, purpose="signup")
+
+    try:
+        await gate.get_info(request.token, client_ip="1.1.1.1")
+        raise AssertionError("expected a ValueError when escalating with no provider configured")
+    except ValueError:
+        pass

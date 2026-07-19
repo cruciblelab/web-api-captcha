@@ -15,6 +15,7 @@ from webapi_captcha.replay_guard import (
 from webapi_captcha.reputation import StaticBlocklistReputationChecker
 from webapi_captcha.risk import (
     BehaviorScoreRiskSignal,
+    ConditionalRiskSignal,
     CorroboratedRiskSignal,
     MemoryRunningRiskStore,
     ReplayRiskSignal,
@@ -489,3 +490,93 @@ async def test_replay_risk_signal_respects_enabled_toggle_via_risk_engine() -> N
 
     assessment = await engine.assess(RiskContext(signals={"mouse_trajectory": _TRAJECTORY_A}))
     assert "replay" not in assessment.contributions
+
+
+# -- ConditionalRiskSignal: "run `then` only if `when` flags" --
+
+
+async def test_conditional_runs_then_only_when_the_when_signal_flags() -> None:
+    gate = _FixedSignal("gate", 0.9)  # flags (>= default 0.5 threshold)
+    followup = _FixedSignal("followup", 0.7)
+    signal = ConditionalRiskSignal(when=gate, then=followup)
+
+    contribution = await signal.assess(RiskContext())
+
+    assert contribution.suspicion == 0.7  # then's own contribution surfaced
+    assert followup.calls == 1
+
+
+async def test_conditional_skips_then_entirely_when_when_does_not_flag() -> None:
+    gate = _FixedSignal("gate", 0.1)  # below threshold -> does not flag
+    followup = _FixedSignal("followup", 0.9)
+    signal = ConditionalRiskSignal(when=gate, then=followup)
+
+    contribution = await signal.assess(RiskContext())
+
+    assert contribution.suspicion is None  # abstains
+    assert followup.calls == 0  # the expensive check was never run
+
+
+async def test_conditional_treats_a_hard_override_when_signal_as_flagging() -> None:
+    gate = _OverrideSignal("bad-ip", RiskLevel.HIGH)
+    followup = _FixedSignal("followup", 0.6)
+    signal = ConditionalRiskSignal(when=gate, then=followup)
+
+    contribution = await signal.assess(RiskContext())
+
+    assert contribution.suspicion == 0.6
+    assert followup.calls == 1
+
+
+async def test_conditional_when_signal_exception_fails_open_and_skips_then() -> None:
+    followup = _FixedSignal("followup", 0.9)
+    signal = ConditionalRiskSignal(when=_RaisingSignal(), then=followup)
+
+    contribution = await signal.assess(RiskContext())
+
+    assert contribution.suspicion is None
+    assert followup.calls == 0
+
+
+async def test_conditional_then_signal_exception_fails_open() -> None:
+    gate = _FixedSignal("gate", 0.9)
+    signal = ConditionalRiskSignal(when=gate, then=_RaisingSignal())
+
+    contribution = await signal.assess(RiskContext())
+
+    assert contribution.suspicion is None
+
+
+async def test_conditional_chains_a_then_b_then_c() -> None:
+    a = _FixedSignal("a", 0.9)
+    b = _FixedSignal("b", 0.9)
+    c = _FixedSignal("c", 0.8)
+    chain = ConditionalRiskSignal(when=a, then=ConditionalRiskSignal(when=b, then=c))
+
+    contribution = await chain.assess(RiskContext())
+
+    assert contribution.suspicion == 0.8
+    assert a.calls == 1 and b.calls == 1 and c.calls == 1
+
+
+async def test_conditional_chain_stops_at_the_first_non_flagging_link() -> None:
+    a = _FixedSignal("a", 0.9)
+    b = _FixedSignal("b", 0.1)  # does not flag -> c never runs
+    c = _FixedSignal("c", 0.9)
+    chain = ConditionalRiskSignal(when=a, then=ConditionalRiskSignal(when=b, then=c))
+
+    contribution = await chain.assess(RiskContext())
+
+    assert contribution.suspicion is None
+    assert a.calls == 1 and b.calls == 1 and c.calls == 0
+
+
+async def test_conditional_integrates_into_risk_engine_gating_an_expensive_check() -> None:
+    cheap_gate = _FixedSignal("cheap", 0.1)  # clean -> expensive check skipped
+    expensive = _FixedSignal("expensive", 0.9)
+    engine = RiskEngine([ConditionalRiskSignal(when=cheap_gate, then=expensive)])
+
+    assessment = await engine.assess(RiskContext())
+
+    assert assessment.level == RiskLevel.MINIMAL
+    assert expensive.calls == 0

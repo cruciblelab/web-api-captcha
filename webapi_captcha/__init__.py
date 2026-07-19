@@ -79,6 +79,7 @@ from webapi_captcha.replay_guard import (
 from webapi_captcha.reputation import IPReputationChecker, StaticBlocklistReputationChecker
 from webapi_captcha.risk import (
     BehaviorScoreRiskSignal,
+    ConditionalRiskSignal,
     CorroboratedRiskSignal,
     MemoryRunningRiskStore,
     ReplayRiskSignal,
@@ -146,6 +147,7 @@ __all__ = [
     "CheckOutcome",
     "CheckResult",
     "CloudflareStyleGuard",
+    "ConditionalRiskSignal",
     "CorroboratedRiskSignal",
     "Event",
     "FallbackCaptchaProvider",
